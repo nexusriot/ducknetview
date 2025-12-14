@@ -86,11 +86,12 @@ type Model struct {
 	portsSearching bool
 	portsQuery     string
 
-	procsSearch    textinput.Model
-	procsSearching bool
-	procsQuery     string
-	externalIP     string
-	externalIPErr  error
+	procsSearch         textinput.Model
+	procsSearching      bool
+	procsQuery          string
+	externalIP          string
+	externalIPErr       error
+	externalIPUpdatedAt time.Time
 }
 
 func NewModel() Model {
@@ -165,10 +166,20 @@ func fetchPortsCmd() tea.Cmd {
 
 func fetchExternalIPCmd() tea.Cmd {
 	return func() tea.Msg {
-		// Use a simple HTTPS endpoint that returns plain text IP
 		const url = "https://api.ipify.org"
 
-		c := &http.Client{Timeout: 3 * time.Second}
+		// refresh transport every time
+		tr := &http.Transport{
+			Proxy:               http.ProxyFromEnvironment,
+			DisableKeepAlives:   true,
+			TLSHandshakeTimeout: 3 * time.Second,
+		}
+
+		c := &http.Client{
+			Timeout:   4 * time.Second,
+			Transport: tr,
+		}
+
 		resp, err := c.Get(url)
 		if err != nil {
 			return externalIPMsg{"", err}
@@ -188,7 +199,8 @@ func fetchExternalIPCmd() tea.Cmd {
 		if ip == "" {
 			return externalIPMsg{"", fmt.Errorf("external ip: empty response")}
 		}
-		return externalIPMsg{ip, nil}
+
+		return externalIPMsg{ip: ip, err: nil}
 	}
 }
 
@@ -236,11 +248,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case externalIPMsg:
 		if msg.err != nil {
 			m.externalIPErr = msg.err
-			// keep last known IP
 			return m, nil
 		}
 		m.externalIP = msg.ip
 		m.externalIPErr = nil
+		m.externalIPUpdatedAt = time.Now()
 		return m, nil
 
 	case tickMsg:
@@ -368,11 +380,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.ifaceList, cmd = m.ifaceList.Update(msg)
 
+		needExtRefresh := false
+
 		// Auto-follow selection
 		if it, ok := m.ifaceList.SelectedItem().(ifaceItem); ok {
 			if m.selectedIface != it.name {
 				m.selectedIface = it.name
 				m.rxHist, m.txHist = nil, nil
+				needExtRefresh = true
 
 				m.ifaceDetailsText = m.renderIfaceDetailsText()
 				m.ifaceDetailsVP.SetContent(m.ifaceDetailsText)
@@ -383,7 +398,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd2 tea.Cmd
 		m.ifaceDetailsVP, cmd2 = m.ifaceDetailsVP.Update(msg)
 
-		return m, tea.Batch(cmd, cmd2, fetchExternalIPCmd())
+		if needExtRefresh {
+			return m, tea.Batch(cmd, cmd2, fetchExternalIPCmd())
+		}
+		return m, tea.Batch(cmd, cmd2)
 	}
 
 	if m.activeTab == tabPorts && m.portsSearching {
@@ -529,7 +547,18 @@ func (m Model) viewOverview() string {
 	if ext == "" {
 		ext = "…"
 	}
-	b.WriteString(fmt.Sprintf("External IP: %s\n", ext))
+
+	line := fmt.Sprintf("External IP: %s", ext)
+	if !m.externalIPUpdatedAt.IsZero() {
+		line += fmt.Sprintf("  (updated %s)", m.externalIPUpdatedAt.Format("15:04:05"))
+	}
+	b.WriteString(line + "\n")
+
+	if m.externalIPErr != nil {
+		b.WriteString(fmt.Sprintf("External IP error: %s\n", subtleStyle.Render(m.externalIPErr.Error())))
+	}
+
+	//b.WriteString(fmt.Sprintf("External IP: %s\n", ext))
 
 	if m.externalIPErr != nil && m.externalIP == "" {
 		b.WriteString(fmt.Sprintf("External IP: %s\n", subtleStyle.Render("unavailable")))
