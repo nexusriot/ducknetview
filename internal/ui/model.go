@@ -23,6 +23,8 @@ const (
 	tabIfaces
 	tabPorts
 	tabProcs
+	headerH = 1
+	footerH = 1
 )
 
 type tickMsg time.Time
@@ -208,7 +210,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Layout sizing
 		leftW := max(26, m.w/3)
-		bodyH := max(8, m.h-6)
+		bodyH := max(8, m.h-headerH-footerH-2)
 
 		m.ifaceList.SetSize(leftW, bodyH)
 
@@ -537,7 +539,8 @@ func (m Model) viewOverview() string {
 
 func (m Model) viewIfaces() string {
 	leftW := max(26, m.w/3)
-	bodyH := max(8, m.h-6)
+	bodyH := max(8, m.h-headerH-footerH-2)
+
 	left := boxStyle.Width(leftW).Height(bodyH).Render(m.ifaceList.View())
 
 	rightW := m.w - leftW - 3
