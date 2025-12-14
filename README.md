@@ -9,6 +9,10 @@ Built with:
 
 The focus is a clean, usable terminal UI even on hosts with many interfaces (Docker, bridges, veth).
 
+![Overview](resources/1.png)
+![Interfaces](resources/2.png)
+![Ports](resources/3.png)
+![Processes](resources/4.png)
 ---
 
 ## Features
