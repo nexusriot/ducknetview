@@ -28,7 +28,6 @@ const (
 )
 
 type tickMsg time.Time
-
 type extIPTickMsg time.Time
 
 type externalIPMsg struct {
@@ -56,8 +55,7 @@ func (i ifaceItem) FilterValue() string { return i.name }
 type Model struct {
 	w, h int
 
-	activeTab tab
-
+	activeTab  tab
 	netSampler *probe.NetSampler
 
 	lastSnap probe.NetSnapshot
@@ -86,9 +84,10 @@ type Model struct {
 	portsSearching bool
 	portsQuery     string
 
-	procsSearch         textinput.Model
-	procsSearching      bool
-	procsQuery          string
+	procsSearch    textinput.Model
+	procsSearching bool
+	procsQuery     string
+
 	externalIP          string
 	externalIPErr       error
 	externalIPUpdatedAt time.Time
@@ -139,6 +138,12 @@ func (m Model) Init() tea.Cmd {
 	)
 }
 
+// bodyHeight returns height available for the tab body area.
+// We also subtract a small constant for borders/padding breathing room.
+func (m Model) bodyHeight() int {
+	return max(8, m.h-headerH-footerH-2)
+}
+
 func (m Model) refreshCmd() tea.Cmd {
 	return func() tea.Msg {
 		snap, err := m.netSampler.Sample()
@@ -164,11 +169,21 @@ func fetchPortsCmd() tea.Cmd {
 	}
 }
 
+func fetchProcsCmd() tea.Cmd {
+	return func() tea.Msg {
+		procs, err := probe.TopProcsByConnections(80)
+		if err != nil {
+			return errMsg{err}
+		}
+		return procsMsg(procs)
+	}
+}
+
 func fetchExternalIPCmd() tea.Cmd {
 	return func() tea.Msg {
 		const url = "https://api.ipify.org"
 
-		// refresh transport every time
+		// Fresh transport each time avoids stale keep-alive sockets after VPN / route changes.
 		tr := &http.Transport{
 			Proxy:               http.ProxyFromEnvironment,
 			DisableKeepAlives:   true,
@@ -204,41 +219,25 @@ func fetchExternalIPCmd() tea.Cmd {
 	}
 }
 
-func fetchProcsCmd() tea.Cmd {
-	return func() tea.Msg {
-		procs, err := probe.TopProcsByConnections(80)
-		if err != nil {
-			return errMsg{err}
-		}
-		return procsMsg(procs)
-	}
-}
-
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 
-		// Layout sizing
 		leftW := max(26, m.w/3)
-		bodyH := max(8, m.h-headerH-footerH-2)
+		bodyH := m.bodyHeight()
 
 		m.ifaceList.SetSize(leftW, bodyH)
 
-		// Ports viewport inside a bordered box with padding(0,1) => subtract ~2
 		portsW := min(m.w-2, 120)
-		portsH := bodyH
 		m.portsVP.Width = max(10, portsW-2)
-		m.portsVP.Height = max(5, portsH-2)
+		m.portsVP.Height = max(5, bodyH-2)
 
-		// Procs viewport
 		procsW := min(m.w-2, 120)
-		procsH := bodyH
 		m.procsVP.Width = max(10, procsW-2)
-		m.procsVP.Height = max(5, procsH-2)
+		m.procsVP.Height = max(5, bodyH-2)
 
-		// Iface details viewport (right panel)
 		rightW := m.w - leftW - 3
 		m.ifaceDetailsVP.Width = max(10, rightW-2)
 		m.ifaceDetailsVP.Height = max(5, bodyH-2)
@@ -257,23 +256,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		cmds := []tea.Cmd{m.refreshCmd(), tickEvery(1 * time.Second)}
-
 		if time.Now().Unix()%5 == 0 {
 			cmds = append(cmds, fetchPortsCmd(), fetchProcsCmd())
 		}
 		return m, tea.Batch(cmds...)
 
 	case extIPTickMsg:
-		return m, tea.Batch(
-			fetchExternalIPCmd(),
-			extIPTickEvery(30*time.Second),
-		)
+		return m, tea.Batch(fetchExternalIPCmd(), extIPTickEvery(30*time.Second))
 
 	case snapMsg:
 		m.lastSnap = probe.NetSnapshot(msg)
 		m.err = nil
 
-		// build interface list
 		items := make([]list.Item, 0, len(m.lastSnap.Ifaces))
 		for _, ii := range m.lastSnap.Ifaces {
 			desc := fmt.Sprintf("MAC %s  RX %s  TX %s",
@@ -285,12 +279,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.ifaceList.SetItems(items)
 
-		// default selected iface
 		if m.selectedIface == "" && len(m.lastSnap.Ifaces) > 0 {
 			m.selectedIface = m.lastSnap.Ifaces[0].Name
 		}
 
-		// Update hist for currently selected iface
 		for _, ii := range m.lastSnap.Ifaces {
 			if ii.Name == m.selectedIface {
 				m.rxHist = append(m.rxHist, ii.RxBps)
@@ -303,10 +295,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// update iface details viewport content
 		m.ifaceDetailsText = m.renderIfaceDetailsText()
 		m.ifaceDetailsVP.SetContent(m.ifaceDetailsText)
-
 		return m, nil
 
 	case portsMsg:
@@ -330,6 +320,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "q":
+			// disabled (no-op)
 			return m, nil
 		case "tab":
 			m.activeTab = (m.activeTab + 1) % 4
@@ -343,6 +334,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "left":
 			m.activeTab = (m.activeTab + 3) % 4
 			return m, nil
+
 		case "/":
 			if m.activeTab == tabPorts {
 				m.portsSearching = true
@@ -356,6 +348,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsSearch.SetValue(m.procsQuery)
 				return m, nil
 			}
+
 		case "ctrl+u":
 			if m.activeTab == tabPorts && !m.portsSearching {
 				m.portsQuery = ""
@@ -371,11 +364,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsVP.SetContent(m.procsText)
 				return m, nil
 			}
+
 		case "e":
 			return m, fetchExternalIPCmd()
 		}
 	}
 
+	// Interfaces tab
 	if m.activeTab == tabIfaces {
 		var cmd tea.Cmd
 		m.ifaceList, cmd = m.ifaceList.Update(msg)
@@ -394,7 +389,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Allow scrolling inside right details panel (if content long)
 		var cmd2 tea.Cmd
 		m.ifaceDetailsVP, cmd2 = m.ifaceDetailsVP.Update(msg)
 
@@ -404,6 +398,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmd, cmd2)
 	}
 
+	// Ports search mode
 	if m.activeTab == tabPorts && m.portsSearching {
 		var cmd tea.Cmd
 		m.portsSearch, cmd = m.portsSearch.Update(msg)
@@ -414,14 +409,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.portsQuery = strings.TrimSpace(m.portsSearch.Value())
 				m.portsSearching = false
 				m.portsSearch.Blur()
-				m.portsText = m.renderPortsText() // re-render with filter+highlight
+				m.portsText = m.renderPortsText()
 				m.portsVP.SetContent(m.portsText)
 				return m, nil
+
 			case "esc":
 				m.portsSearching = false
 				m.portsSearch.Blur()
 				return m, nil
+
 			case "ctrl+u":
+				// Clear input while editing; keep search mode active.
 				m.portsSearch.SetValue("")
 				return m, cmd
 			}
@@ -429,6 +427,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Procs search mode
 	if m.activeTab == tabProcs && m.procsSearching {
 		var cmd tea.Cmd
 		m.procsSearch, cmd = m.procsSearch.Update(msg)
@@ -442,15 +441,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsText = m.renderProcsText()
 				m.procsVP.SetContent(m.procsText)
 				return m, nil
+
 			case "esc":
 				m.procsSearching = false
 				m.procsSearch.Blur()
 				return m, nil
+
 			case "ctrl+u":
 				m.procsSearch.SetValue("")
 				return m, cmd
 			}
-
 		}
 		return m, cmd
 	}
@@ -487,7 +487,7 @@ func (m Model) View() string {
 		body = m.viewProcs()
 	}
 
-	footer := subtleStyle.Render("Keys: tab/shift+tab • (Ports/Procs) ↑↓ PgUp/PgDn Home/End")
+	footer := subtleStyle.Render("Keys: tab/shift+tab • ←/→ tabs • (Ports/Procs) ↑↓ PgUp/PgDn Home/End • / search • Ctrl+u clear • e ext-ip • ctrl+c quit")
 	if m.err != nil {
 		footer = errStyle.Render("Error: " + m.err.Error())
 	}
@@ -502,10 +502,20 @@ func (m Model) renderHeader() string {
 		renderTab("3 Ports", m.activeTab == tabPorts),
 		renderTab("4 Processes", m.activeTab == tabProcs),
 	}
+
 	left := titleStyle.Render("ducknetview 🦆 0.0.3") + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
 	right := strings.Join(tabs, " ")
-	line := lipgloss.NewStyle().Width(m.w).Render(left + padTo(m.w-lipgloss.Width(left), right))
-	return line
+
+	rem := m.w - lipgloss.Width(left)
+	if rem < 0 {
+		rem = 0
+	}
+
+	// Make header ALWAYS single-line: truncate right part to remaining width.
+	right = fitToWidth(right, rem)
+
+	line := left + padTo(rem, right)
+	return lipgloss.NewStyle().Width(m.w).Render(line)
 }
 
 func renderTab(s string, active bool) string {
@@ -539,36 +549,29 @@ func (m Model) viewOverview() string {
 		subtleStyle.Render(fmt.Sprintf("%d", down)),
 	))
 
-	// Selected interface card (same as right panel)
 	b.WriteString(titleStyle.Render("Selected interface") + "\n")
 	b.WriteString(m.renderIfaceDetailsText())
+	b.WriteString("\n")
 
 	ext := m.externalIP
 	if ext == "" {
 		ext = "…"
 	}
-
 	line := fmt.Sprintf("External IP: %s", ext)
 	if !m.externalIPUpdatedAt.IsZero() {
 		line += fmt.Sprintf("  (updated %s)", m.externalIPUpdatedAt.Format("15:04:05"))
 	}
 	b.WriteString(line + "\n")
-
 	if m.externalIPErr != nil {
 		b.WriteString(fmt.Sprintf("External IP error: %s\n", subtleStyle.Render(m.externalIPErr.Error())))
 	}
 
-	//b.WriteString(fmt.Sprintf("External IP: %s\n", ext))
-
-	if m.externalIPErr != nil && m.externalIP == "" {
-		b.WriteString(fmt.Sprintf("External IP: %s\n", subtleStyle.Render("unavailable")))
-	}
-	return boxStyle.Width(min(m.w-2, 120)).Height(max(8, m.h-6)).Render(b.String())
+	return boxStyle.Width(min(m.w-2, 120)).Height(m.bodyHeight()).Render(b.String())
 }
 
 func (m Model) viewIfaces() string {
 	leftW := max(26, m.w/3)
-	bodyH := max(8, m.h-headerH-footerH-2)
+	bodyH := m.bodyHeight()
 
 	left := boxStyle.Width(leftW).Height(bodyH).Render(m.ifaceList.View())
 
@@ -582,15 +585,18 @@ func (m Model) viewIfaces() string {
 
 func (m Model) viewPorts() string {
 	portsW := min(m.w-2, 120)
-	portsH := max(8, m.h-6)
+	portsH := m.bodyHeight()
 
+	// Reserve 2 lines for search UI inside the box
+	searchUIH := 2
 	m.portsVP.Width = max(10, portsW-2)
-	m.portsVP.Height = max(5, portsH-2)
+	m.portsVP.Height = max(5, (portsH-2)-searchUIH)
 
 	if m.portsText == "" {
 		m.portsText = m.renderPortsText()
 		m.portsVP.SetContent(m.portsText)
 	}
+
 	searchLine := subtleStyle.Render("Press / to search")
 	if m.portsQuery != "" {
 		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.portsQuery) + subtleStyle.Render("  (press / to change, ctrl+u to clear)")
@@ -600,13 +606,12 @@ func (m Model) viewPorts() string {
 	}
 
 	content := searchLine + "\n\n" + m.portsVP.View()
-
 	return boxStyle.Width(portsW).Height(portsH).Render(content)
 }
 
 func (m Model) viewProcs() string {
 	procsW := min(m.w-2, 120)
-	procsH := max(8, m.h-6)
+	procsH := m.bodyHeight()
 
 	// Reserve 2 lines for search UI inside the box
 	searchUIH := 2
@@ -669,12 +674,10 @@ func (m Model) renderPortsText() string {
 			local = "-"
 		}
 
-		// filter
 		if q != "" && !(containsFold(local, q) || containsFold(proc, q) || containsFold(p.Proto, q)) {
 			continue
 		}
 
-		// truncate/pad FIRST (so columns stay aligned), then highlight
 		proto := padRight(trunc(p.Proto, colProto), colProto)
 
 		localTr := padRight(trunc(local, colLocal), colLocal)
@@ -685,7 +688,6 @@ func (m Model) renderPortsText() string {
 		}
 		procTr = trunc(procTr, rest)
 
-		// highlight in visible fields
 		localTr = highlightFold(localTr, q)
 		procTr = highlightFold(procTr, q)
 
@@ -694,9 +696,6 @@ func (m Model) renderPortsText() string {
 		b.WriteString(fmt.Sprintf("%s  %s  %s %s\n", proto, localTr, pid, procTr))
 	}
 
-	if m.portsQuery != "" {
-		b.WriteString("Filter: " + m.portsQuery + "  (press / to edit, Ctrl+u to clear while editing)\n\n")
-	}
 	return b.String()
 }
 
@@ -746,7 +745,6 @@ func (m Model) renderProcsText() string {
 			name = "-"
 		}
 
-		// filter by name (and PID)
 		if q != "" && !(containsFold(name, q) || containsFold(fmt.Sprintf("%d", p.PID), q)) {
 			continue
 		}
@@ -757,7 +755,7 @@ func (m Model) renderProcsText() string {
 		lisS := padRight(trunc(fmt.Sprintf("%d", p.ListenCount), colListen), colListen)
 
 		nameS = highlightFold(nameS, q)
-		pidS = highlightFold(pidS, q) // optional, if searching PID
+		pidS = highlightFold(pidS, q)
 
 		b.WriteString(fmt.Sprintf("%s  %s  %s  %s\n", pidS, nameS, conS, lisS))
 	}
@@ -801,6 +799,18 @@ func (m Model) renderIfaceDetailsText() string {
 }
 
 // helpers
+
+func fitToWidth(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	// Uses your existing trunc() helper (keeps the rest of the project consistent).
+	return trunc(s, w)
+}
+
 func padTo(width int, s string) string {
 	if width <= 0 {
 		return ""
@@ -849,7 +859,6 @@ func highlightFold(s, q string) string {
 		}
 		j += i
 		out.WriteString(s[i:j])
-		// \x1b[7m = reverse, \x1b[0m reset
 		out.WriteString("\x1b[7m")
 		out.WriteString(s[j : j+len(q)])
 		out.WriteString("\x1b[0m")
