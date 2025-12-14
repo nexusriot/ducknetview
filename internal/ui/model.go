@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -25,8 +27,19 @@ const (
 
 type tickMsg time.Time
 
+type extIPTickMsg time.Time
+
+type externalIPMsg struct {
+	ip  string
+	err error
+}
+
 func tickEvery(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func extIPTickEvery(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg { return extIPTickMsg(t) })
 }
 
 type ifaceItem struct {
@@ -74,6 +87,8 @@ type Model struct {
 	procsSearch    textinput.Model
 	procsSearching bool
 	procsQuery     string
+	externalIP     string
+	externalIPErr  error
 }
 
 func NewModel() Model {
@@ -115,6 +130,8 @@ func (m Model) Init() tea.Cmd {
 		m.refreshCmd(),
 		fetchPortsCmd(),
 		fetchProcsCmd(),
+		fetchExternalIPCmd(),
+		extIPTickEvery(30*time.Second),
 		tickEvery(1*time.Second),
 	)
 }
@@ -141,6 +158,35 @@ func fetchPortsCmd() tea.Cmd {
 			return errMsg{err}
 		}
 		return portsMsg(ports)
+	}
+}
+
+func fetchExternalIPCmd() tea.Cmd {
+	return func() tea.Msg {
+		// Use a simple HTTPS endpoint that returns plain text IP
+		const url = "https://api.ipify.org"
+
+		c := &http.Client{Timeout: 3 * time.Second}
+		resp, err := c.Get(url)
+		if err != nil {
+			return externalIPMsg{"", err}
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return externalIPMsg{"", fmt.Errorf("external ip: http %d", resp.StatusCode)}
+		}
+
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+		if err != nil {
+			return externalIPMsg{"", err}
+		}
+
+		ip := strings.TrimSpace(string(b))
+		if ip == "" {
+			return externalIPMsg{"", fmt.Errorf("external ip: empty response")}
+		}
+		return externalIPMsg{ip, nil}
 	}
 }
 
@@ -185,15 +231,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		return m, nil
 
+	case externalIPMsg:
+		if msg.err != nil {
+			m.externalIPErr = msg.err
+			// keep last known IP
+			return m, nil
+		}
+		m.externalIP = msg.ip
+		m.externalIPErr = nil
+		return m, nil
+
 	case tickMsg:
-		// refresh snapshot every second
 		cmds := []tea.Cmd{m.refreshCmd(), tickEvery(1 * time.Second)}
 
-		// refresh ports & procs every 5 seconds
 		if time.Now().Unix()%5 == 0 {
 			cmds = append(cmds, fetchPortsCmd(), fetchProcsCmd())
 		}
 		return m, tea.Batch(cmds...)
+
+	case extIPTickMsg:
+		return m, tea.Batch(
+			fetchExternalIPCmd(),
+			extIPTickEvery(30*time.Second),
+		)
 
 	case snapMsg:
 		m.lastSnap = probe.NetSnapshot(msg)
@@ -297,7 +357,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsVP.SetContent(m.procsText)
 				return m, nil
 			}
-
+		case "e":
+			return m, fetchExternalIPCmd()
 		}
 	}
 
@@ -320,7 +381,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd2 tea.Cmd
 		m.ifaceDetailsVP, cmd2 = m.ifaceDetailsVP.Update(msg)
 
-		return m, tea.Batch(cmd, cmd2)
+		return m, tea.Batch(cmd, cmd2, fetchExternalIPCmd())
 	}
 
 	if m.activeTab == tabPorts && m.portsSearching {
@@ -369,6 +430,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsSearch.SetValue("")
 				return m, cmd
 			}
+
 		}
 		return m, cmd
 	}
@@ -461,6 +523,15 @@ func (m Model) viewOverview() string {
 	b.WriteString(titleStyle.Render("Selected interface") + "\n")
 	b.WriteString(m.renderIfaceDetailsText())
 
+	ext := m.externalIP
+	if ext == "" {
+		ext = "…"
+	}
+	b.WriteString(fmt.Sprintf("External IP: %s\n", ext))
+
+	if m.externalIPErr != nil && m.externalIP == "" {
+		b.WriteString(fmt.Sprintf("External IP: %s\n", subtleStyle.Render("unavailable")))
+	}
 	return boxStyle.Width(min(m.w-2, 120)).Height(max(8, m.h-6)).Render(b.String())
 }
 
