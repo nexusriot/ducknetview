@@ -1,0 +1,6 @@
+Package: ducknetview
+Version: _version_
+Architecture: amd64
+Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
+Description: Simple network monitoring TUI
+Installed-Size: 7300

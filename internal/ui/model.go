@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -65,6 +66,14 @@ type Model struct {
 
 	ifaceDetailsVP   viewport.Model
 	ifaceDetailsText string
+
+	portsSearch    textinput.Model
+	portsSearching bool
+	portsQuery     string
+
+	procsSearch    textinput.Model
+	procsSearching bool
+	procsQuery     string
 }
 
 func NewModel() Model {
@@ -77,6 +86,16 @@ func NewModel() Model {
 	kvp := viewport.New(0, 0)
 	dvp := viewport.New(0, 0)
 
+	ps := textinput.New()
+	ps.Placeholder = "search port / address / process"
+	ps.Prompt = "/ "
+	ps.CharLimit = 64
+
+	qs := textinput.New()
+	qs.Placeholder = "search process name"
+	qs.Prompt = "/ "
+	qs.CharLimit = 64
+
 	return Model{
 		activeTab:  tabOverview,
 		netSampler: probe.NewNetSampler(),
@@ -86,6 +105,8 @@ func NewModel() Model {
 		portsVP:        pvp,
 		procsVP:        kvp,
 		ifaceDetailsVP: dvp,
+		portsSearch:    ps,
+		procsSearch:    qs,
 	}
 }
 
@@ -232,25 +253,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			return m, tea.Quit
+		case "q":
+			return m, nil
 		case "tab":
 			m.activeTab = (m.activeTab + 1) % 4
 			return m, nil
 		case "shift+tab":
 			m.activeTab = (m.activeTab + 3) % 4
-			return m, nil
-		case "1":
-			m.activeTab = tabOverview
-			return m, nil
-		case "2":
-			m.activeTab = tabIfaces
-			return m, nil
-		case "3":
-			m.activeTab = tabPorts
-			return m, nil
-		case "4":
-			m.activeTab = tabProcs
 			return m, nil
 		case "right":
 			m.activeTab = (m.activeTab + 1) % 4
@@ -258,9 +269,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "left":
 			m.activeTab = (m.activeTab + 3) % 4
 			return m, nil
+		case "/":
+			if m.activeTab == tabPorts {
+				m.portsSearching = true
+				m.portsSearch.Focus()
+				m.portsSearch.SetValue(m.portsQuery)
+				return m, nil
+			}
+			if m.activeTab == tabProcs {
+				m.procsSearching = true
+				m.procsSearch.Focus()
+				m.procsSearch.SetValue(m.procsQuery)
+				return m, nil
+			}
+		case "ctrl+u":
+			if m.activeTab == tabPorts && !m.portsSearching {
+				m.portsQuery = ""
+				m.portsSearch.SetValue("")
+				m.portsText = m.renderPortsText()
+				m.portsVP.SetContent(m.portsText)
+				return m, nil
+			}
+			if m.activeTab == tabProcs && !m.procsSearching {
+				m.procsQuery = ""
+				m.procsSearch.SetValue("")
+				m.procsText = m.renderProcsText()
+				m.procsVP.SetContent(m.procsText)
+				return m, nil
+			}
 
 		}
-
 	}
 
 	if m.activeTab == tabIfaces {
@@ -283,6 +321,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ifaceDetailsVP, cmd2 = m.ifaceDetailsVP.Update(msg)
 
 		return m, tea.Batch(cmd, cmd2)
+	}
+
+	if m.activeTab == tabPorts && m.portsSearching {
+		var cmd tea.Cmd
+		m.portsSearch, cmd = m.portsSearch.Update(msg)
+
+		if km, ok := msg.(tea.KeyMsg); ok {
+			switch km.String() {
+			case "enter":
+				m.portsQuery = strings.TrimSpace(m.portsSearch.Value())
+				m.portsSearching = false
+				m.portsSearch.Blur()
+				m.portsText = m.renderPortsText() // re-render with filter+highlight
+				m.portsVP.SetContent(m.portsText)
+				return m, nil
+			case "esc":
+				m.portsSearching = false
+				m.portsSearch.Blur()
+				return m, nil
+			case "ctrl+u":
+				m.portsSearch.SetValue("")
+				return m, cmd
+			}
+		}
+		return m, cmd
+	}
+
+	if m.activeTab == tabProcs && m.procsSearching {
+		var cmd tea.Cmd
+		m.procsSearch, cmd = m.procsSearch.Update(msg)
+
+		if km, ok := msg.(tea.KeyMsg); ok {
+			switch km.String() {
+			case "enter":
+				m.procsQuery = strings.TrimSpace(m.procsSearch.Value())
+				m.procsSearching = false
+				m.procsSearch.Blur()
+				m.procsText = m.renderProcsText()
+				m.procsVP.SetContent(m.procsText)
+				return m, nil
+			case "esc":
+				m.procsSearching = false
+				m.procsSearch.Blur()
+				return m, nil
+			case "ctrl+u":
+				m.procsSearch.SetValue("")
+				return m, cmd
+			}
+		}
+		return m, cmd
 	}
 
 	// Ports tab: scroll via viewport
@@ -317,7 +405,7 @@ func (m Model) View() string {
 		body = m.viewProcs()
 	}
 
-	footer := subtleStyle.Render("Keys: 1-4 tabs • tab/shift+tab • (Ports/Procs) ↑↓ PgUp/PgDn Home/End • q quit")
+	footer := subtleStyle.Render("Keys: tab/shift+tab • (Ports/Procs) ↑↓ PgUp/PgDn Home/End")
 	if m.err != nil {
 		footer = errStyle.Render("Error: " + m.err.Error())
 	}
@@ -400,23 +488,43 @@ func (m Model) viewPorts() string {
 		m.portsText = m.renderPortsText()
 		m.portsVP.SetContent(m.portsText)
 	}
+	searchLine := subtleStyle.Render("Press / to search")
+	if m.portsQuery != "" {
+		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.portsQuery) + subtleStyle.Render("  (press / to change, ctrl+u to clear)")
+	}
+	if m.portsSearching {
+		searchLine = m.portsSearch.View()
+	}
 
-	return boxStyle.Width(portsW).Height(portsH).Render(m.portsVP.View())
+	content := searchLine + "\n\n" + m.portsVP.View()
+
+	return boxStyle.Width(portsW).Height(portsH).Render(content)
 }
 
 func (m Model) viewProcs() string {
 	procsW := min(m.w-2, 120)
 	procsH := max(8, m.h-6)
 
+	// Reserve 2 lines for search UI inside the box
+	searchUIH := 2
 	m.procsVP.Width = max(10, procsW-2)
-	m.procsVP.Height = max(5, procsH-2)
+	m.procsVP.Height = max(5, (procsH-2)-searchUIH)
 
 	if m.procsText == "" {
 		m.procsText = m.renderProcsText()
 		m.procsVP.SetContent(m.procsText)
 	}
 
-	return boxStyle.Width(procsW).Height(procsH).Render(m.procsVP.View())
+	searchLine := subtleStyle.Render("Press / to search")
+	if m.procsQuery != "" {
+		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.procsQuery) + subtleStyle.Render("  (press / to change, ctrl+u to clear)")
+	}
+	if m.procsSearching {
+		searchLine = m.procsSearch.View()
+	}
+
+	content := searchLine + "\n\n" + m.procsVP.View()
+	return boxStyle.Width(procsW).Height(procsH).Render(content)
 }
 
 func (m Model) renderPortsText() string {
@@ -446,30 +554,46 @@ func (m Model) renderPortsText() string {
 		return b.String()
 	}
 
+	q := m.portsQuery
+
 	for _, p := range m.ports {
 		proc := p.Process
 		if proc == "" {
 			proc = "-"
 		}
-
 		local := p.Local
 		if local == ":" || local == "0.0.0.0:0" {
 			local = "-"
 		}
 
-		proto := padRight(trunc(p.Proto, colProto), colProto)
-		local = padRight(trunc(local, colLocal), colLocal)
-		pid := padRight(fmt.Sprintf("%d", p.PID), colPID)
+		// filter
+		if q != "" && !(containsFold(local, q) || containsFold(proc, q) || containsFold(p.Proto, q)) {
+			continue
+		}
 
+		// truncate/pad FIRST (so columns stay aligned), then highlight
+		proto := padRight(trunc(p.Proto, colProto), colProto)
+
+		localTr := padRight(trunc(local, colLocal), colLocal)
+		procTr := proc
 		rest := w - (colProto + 2 + colLocal + 2 + colPID + 1)
 		if rest < 5 {
 			rest = 5
 		}
-		proc = trunc(proc, rest)
+		procTr = trunc(procTr, rest)
 
-		b.WriteString(fmt.Sprintf("%s  %s  %s %s\n", proto, local, pid, proc))
+		// highlight in visible fields
+		localTr = highlightFold(localTr, q)
+		procTr = highlightFold(procTr, q)
+
+		pid := padRight(fmt.Sprintf("%d", p.PID), colPID)
+
+		b.WriteString(fmt.Sprintf("%s  %s  %s %s\n", proto, localTr, pid, procTr))
 	}
 
+	if m.portsQuery != "" {
+		b.WriteString("Filter: " + m.portsQuery + "  (press / to edit, Ctrl+u to clear while editing)\n\n")
+	}
 	return b.String()
 }
 
@@ -511,19 +635,28 @@ func (m Model) renderProcsText() string {
 		return b.String()
 	}
 
+	q := m.procsQuery
+
 	for _, p := range m.procs {
 		name := p.Name
 		if name == "" {
 			name = "-"
 		}
 
-		line := fmt.Sprintf("%s  %s  %s  %s\n",
-			padRight(trunc(fmt.Sprintf("%d", p.PID), colPID), colPID),
-			padRight(trunc(name, colName), colName),
-			padRight(trunc(fmt.Sprintf("%d", p.ConnCount), colConns), colConns),
-			padRight(trunc(fmt.Sprintf("%d", p.ListenCount), colListen), colListen),
-		)
-		b.WriteString(line)
+		// filter by name (and PID)
+		if q != "" && !(containsFold(name, q) || containsFold(fmt.Sprintf("%d", p.PID), q)) {
+			continue
+		}
+
+		pidS := padRight(trunc(fmt.Sprintf("%d", p.PID), colPID), colPID)
+		nameS := padRight(trunc(name, colName), colName)
+		conS := padRight(trunc(fmt.Sprintf("%d", p.ConnCount), colConns), colConns)
+		lisS := padRight(trunc(fmt.Sprintf("%d", p.ListenCount), colListen), colListen)
+
+		nameS = highlightFold(nameS, q)
+		pidS = highlightFold(pidS, q) // optional, if searching PID
+
+		b.WriteString(fmt.Sprintf("%s  %s  %s  %s\n", pidS, nameS, conS, lisS))
 	}
 
 	return b.String()
@@ -587,4 +720,37 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func containsFold(s, q string) bool {
+	if q == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(s), strings.ToLower(q))
+}
+
+func highlightFold(s, q string) string {
+	if q == "" {
+		return s
+	}
+	ls := strings.ToLower(s)
+	lq := strings.ToLower(q)
+
+	var out strings.Builder
+	i := 0
+	for {
+		j := strings.Index(ls[i:], lq)
+		if j < 0 {
+			out.WriteString(s[i:])
+			break
+		}
+		j += i
+		out.WriteString(s[i:j])
+		// \x1b[7m = reverse, \x1b[0m reset
+		out.WriteString("\x1b[7m")
+		out.WriteString(s[j : j+len(q)])
+		out.WriteString("\x1b[0m")
+		i = j + len(q)
+	}
+	return out.String()
 }
