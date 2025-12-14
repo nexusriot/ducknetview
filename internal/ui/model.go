@@ -62,16 +62,16 @@ type Model struct {
 	lastSnap probe.NetSnapshot
 	err      error
 
-	// Interfaces list + selection
+	// Interfaces list
 	ifaceList      list.Model
 	selectedIface  string
 	rxHist, txHist []float64
 
-	// Ports / procs data
+	// Ports / procs
 	ports []probe.ListenPort
 	procs []probe.ProcNet
 
-	// Viewports for scrolling
+	// Viewports
 	portsVP   viewport.Model
 	portsText string
 
@@ -229,19 +229,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		leftW := max(26, m.w/3)
 		bodyH := m.bodyHeight()
 
-		m.ifaceList.SetSize(leftW, bodyH)
+		m.ifaceList.SetSize(
+			max(1, leftW-2),
+			max(1, bodyH-2),
+		)
 
+		// Ports
 		portsW := min(m.w-2, 120)
 		m.portsVP.Width = max(10, portsW-2)
-		m.portsVP.Height = max(5, bodyH-2)
+		m.portsVP.Height = max(5, bodyH-4)
 
+		// Procs
 		procsW := min(m.w-2, 120)
 		m.procsVP.Width = max(10, procsW-2)
-		m.procsVP.Height = max(5, bodyH-2)
+		m.procsVP.Height = max(5, bodyH-4)
 
+		// Interfaces right
 		rightW := m.w - leftW - 3
 		m.ifaceDetailsVP.Width = max(10, rightW-2)
 		m.ifaceDetailsVP.Height = max(5, bodyH-2)
+
+		m.ifaceDetailsVP.SetContent(
+			hardClipLinesToWidth(m.ifaceDetailsText, m.ifaceDetailsVP.Width),
+		)
+		m.portsVP.SetContent(
+			hardClipLinesToWidth(m.portsText, m.portsVP.Width),
+		)
+		m.procsVP.SetContent(
+			hardClipLinesToWidth(m.procsText, m.procsVP.Width),
+		)
 
 		return m, nil
 
@@ -269,48 +285,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastSnap = probe.NetSnapshot(msg)
 		m.err = nil
 
-		// Preserve selection (glitch fix): SetItems can reset selection/scroll.
 		prevSel := m.selectedIface
 		prevIndex := m.ifaceList.Index()
 
+		innerW := m.ifaceList.Width()
+		if innerW <= 0 {
+			innerW = 30
+		}
+
+		descMax := max(10, innerW-6)
+
 		items := make([]list.Item, 0, len(m.lastSnap.Ifaces))
 		for _, ii := range m.lastSnap.Ifaces {
-			desc := fmt.Sprintf("MAC %s  RX %s  TX %s",
+			desc := fmt.Sprintf(
+				"MAC %s  RX %s  TX %s",
 				ii.Hardware,
 				probe.HumanBytesPerSec(ii.RxBps),
 				probe.HumanBytesPerSec(ii.TxBps),
 			)
-			items = append(items, ifaceItem{name: ii.Name, desc: desc})
+
+			desc = trunc(desc, descMax)
+			items = append(items, ifaceItem{
+				name: ii.Name,
+				desc: desc,
+			})
 		}
+
 		m.ifaceList.SetItems(items)
 
-		// Ensure we have a selected iface and restore list cursor.
-		if m.selectedIface == "" && len(m.lastSnap.Ifaces) > 0 {
-			m.selectedIface = m.lastSnap.Ifaces[0].Name
+		if m.selectedIface == "" && len(items) > 0 {
 			m.ifaceList.Select(0)
+			m.selectedIface = items[0].(ifaceItem).name
 		} else if prevSel != "" {
-			for idx, it := range items {
-				if ii, ok := it.(ifaceItem); ok && ii.name == prevSel {
-					m.ifaceList.Select(idx)
+			for i, it := range items {
+				if it.(ifaceItem).name == prevSel {
+					m.ifaceList.Select(i)
 					break
 				}
 			}
-		} else if len(items) > 0 {
-			// Fallback: restore previous index if possible
-			if prevIndex >= 0 && prevIndex < len(items) {
-				m.ifaceList.Select(prevIndex)
-				if it, ok := items[prevIndex].(ifaceItem); ok {
-					m.selectedIface = it.name
-				}
-			} else {
-				m.ifaceList.Select(0)
-				if it, ok := items[0].(ifaceItem); ok {
-					m.selectedIface = it.name
-				}
-			}
+		} else if prevIndex >= 0 && prevIndex < len(items) {
+			m.ifaceList.Select(prevIndex)
+			m.selectedIface = items[prevIndex].(ifaceItem).name
 		}
 
-		// Update histories for currently selected iface
 		for _, ii := range m.lastSnap.Ifaces {
 			if ii.Name == m.selectedIface {
 				m.rxHist = append(m.rxHist, ii.RxBps)
@@ -324,18 +341,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.ifaceDetailsText = m.renderIfaceDetailsText()
+		m.ifaceDetailsText = hardClipLinesToWidth(
+			m.ifaceDetailsText,
+			m.ifaceDetailsVP.Width,
+		)
 		m.ifaceDetailsVP.SetContent(m.ifaceDetailsText)
+
 		return m, nil
 
 	case portsMsg:
-		m.ports = []probe.ListenPort(msg)
+		m.ports = msg
 		m.portsText = m.renderPortsText()
+		m.portsText = hardClipLinesToWidth(m.portsText, m.portsVP.Width)
 		m.portsVP.SetContent(m.portsText)
 		return m, nil
 
 	case procsMsg:
-		m.procs = []probe.ProcNet(msg)
+		m.procs = msg
 		m.procsText = m.renderProcsText()
+		m.procsText = hardClipLinesToWidth(m.procsText, m.procsVP.Width)
 		m.procsVP.SetContent(m.procsText)
 		return m, nil
 
@@ -393,7 +417,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-		case "e":
+		case "ctrl+e":
 			return m, fetchExternalIPCmd()
 		}
 	}
@@ -413,6 +437,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				needExtRefresh = true
 
 				m.ifaceDetailsText = m.renderIfaceDetailsText()
+				m.ifaceDetailsText = hardClipLinesToWidth(m.ifaceDetailsText, m.ifaceDetailsVP.Width)
 				m.ifaceDetailsVP.SetContent(m.ifaceDetailsText)
 			}
 		}
@@ -515,12 +540,15 @@ func (m Model) View() string {
 		body = m.viewProcs()
 	}
 
-	footer := subtleStyle.Render("Keys: tab/shift+tab • ←/→ tabs • (Ports/Procs) ↑↓ PgUp/PgDn Home/End • / search • Ctrl+u clear • e ext-ip • ctrl+c quit")
+	footer := subtleStyle.Render("Keys: tab/shift+tab • ←/→ • / search • Ctrl+u clear • ctrl+e ext-ip")
 	if m.err != nil {
 		footer = errStyle.Render("Error: " + m.err.Error())
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	footer = clampToWidthOneLine(footer, m.w)
+	footer = lipgloss.NewStyle().Width(m.w).Render(footer)
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer) + "\x1b[0m"
 }
 
 func (m Model) renderHeader() string {
@@ -532,15 +560,13 @@ func (m Model) renderHeader() string {
 	}
 
 	left := titleStyle.Render("ducknetview 🦆 0.0.4") + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
-	right := strings.Join(tabs, " ")
 
 	rem := m.w - lipgloss.Width(left)
 	if rem < 0 {
 		rem = 0
 	}
 
-	// Make header ALWAYS single-line: truncate right part to remaining width (ANSI-safe).
-	right = fitToWidth(right, rem)
+	right := joinTabsWithinWidth(tabs, rem)
 
 	line := left + padTo(rem, right)
 	return lipgloss.NewStyle().Width(m.w).Render(line)
@@ -604,8 +630,6 @@ func (m Model) viewIfaces() string {
 	left := boxStyle.Width(leftW).Height(bodyH).Render(m.ifaceList.View())
 
 	rightW := m.w - leftW - 3
-	m.ifaceDetailsVP.Width = max(10, rightW-2)
-	m.ifaceDetailsVP.Height = max(5, bodyH-2)
 
 	right := boxStyle.Width(rightW).Height(bodyH).Render(m.ifaceDetailsVP.View())
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
@@ -614,11 +638,6 @@ func (m Model) viewIfaces() string {
 func (m Model) viewPorts() string {
 	portsW := min(m.w-2, 120)
 	portsH := m.bodyHeight()
-
-	// Reserve 2 lines for search UI inside the box
-	searchUIH := 2
-	m.portsVP.Width = max(10, portsW-2)
-	m.portsVP.Height = max(5, (portsH-2)-searchUIH)
 
 	if m.portsText == "" {
 		m.portsText = m.renderPortsText()
@@ -640,11 +659,6 @@ func (m Model) viewPorts() string {
 func (m Model) viewProcs() string {
 	procsW := min(m.w-2, 120)
 	procsH := m.bodyHeight()
-
-	// Reserve 2 lines for search UI inside the box
-	searchUIH := 2
-	m.procsVP.Width = max(10, procsW-2)
-	m.procsVP.Height = max(5, (procsH-2)-searchUIH)
 
 	if m.procsText == "" {
 		m.procsText = m.renderProcsText()
@@ -791,6 +805,44 @@ func (m Model) renderProcsText() string {
 	return b.String()
 }
 
+var hlStyle = lipgloss.NewStyle().Reverse(true)
+
+func highlightFold(s, q string) string {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return s
+	}
+
+	rs := []rune(s)
+	rq := []rune(q)
+
+	ls := strings.ToLower(string(rs))
+	lq := strings.ToLower(string(rq))
+
+	var out strings.Builder
+	i := 0
+	for {
+		j := strings.Index(ls[i:], lq)
+		if j < 0 {
+			out.WriteString(string(rs[i:]))
+			break
+		}
+		j += i
+
+		out.WriteString(string(rs[i:j]))
+
+		end := j + len([]rune(lq))
+		if end > len(rs) {
+			end = len(rs)
+		}
+		out.WriteString(hlStyle.Render(string(rs[j:end])))
+
+		i = end
+	}
+
+	return out.String()
+}
+
 func (m Model) renderIfaceDetailsText() string {
 	var ii *probe.IfaceInfo
 	for k := range m.lastSnap.Ifaces {
@@ -810,7 +862,12 @@ func (m Model) renderIfaceDetailsText() string {
 		st = okStyle
 	}
 
-	chartW := max(30, min(80, m.w/2))
+	avail := m.ifaceDetailsVP.Width
+	if avail <= 0 {
+		avail = 40
+	}
+	chartW := max(10, avail-6)
+
 	rx := Spark(m.rxHist, chartW)
 	tx := Spark(m.txHist, chartW)
 
@@ -827,13 +884,6 @@ func (m Model) renderIfaceDetailsText() string {
 }
 
 // helpers
-
-func fitToWidth(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-	return ansiSafeTruncate(s, w)
-}
 
 func padTo(width int, s string) string {
 	if width <= 0 {
@@ -866,52 +916,60 @@ func containsFold(s, q string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(q))
 }
 
-func highlightFold(s, q string) string {
-	if q == "" {
-		return s
-	}
-	ls := strings.ToLower(s)
-	lq := strings.ToLower(q)
-
-	var out strings.Builder
-	i := 0
-	for {
-		j := strings.Index(ls[i:], lq)
-		if j < 0 {
-			out.WriteString(s[i:])
-			break
-		}
-		j += i
-		out.WriteString(s[i:j])
-		out.WriteString("\x1b[7m")
-		// NOTE: keep your previous behavior; if you want perfect case-insensitive
-		// highlighting for non-ASCII, we can switch to rune-aware matching later.
-		out.WriteString(s[j : j+len(q)])
-		out.WriteString("\x1b[0m")
-		i = j + len(q)
-	}
-	return out.String()
-}
 func ansiSafeTruncate(s string, maxWidth int) string {
 	if maxWidth <= 0 {
 		return ""
 	}
-
 	var out strings.Builder
 	visible := 0
 
 	for i := 0; i < len(s); {
-		// ANSI escape sequence
-		if s[i] == '\x1b' {
-			end := i + 1
-			for end < len(s) && s[end] != 'm' {
-				end++
+		if s[i] == 0x1b { // ESC
+			// CSI: ESC [ ... < 0x40-0x7E>
+			if i+1 < len(s) && s[i+1] == '[' {
+				j := i + 2
+				for j < len(s) {
+					b := s[j]
+					// CSI 0x40..0x7E
+					if b >= 0x40 && b <= 0x7E {
+						j++
+						break
+					}
+					j++
+				}
+				out.WriteString(s[i:j])
+				i = j
+				continue
 			}
-			if end < len(s) {
-				end++ // include 'm'
+
+			if i+1 < len(s) && s[i+1] == ']' {
+				j := i + 2
+				for j < len(s) {
+					// BEL terminator
+					if s[j] == 0x07 {
+						j++
+						break
+					}
+					// ST terminator: ESC
+					if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+						j += 2
+						break
+					}
+					j++
+				}
+				out.WriteString(s[i:j])
+				i = j
+				continue
 			}
-			out.WriteString(s[i:end])
-			i = end
+
+			if i+1 < len(s) {
+				out.WriteByte(s[i])
+				out.WriteByte(s[i+1])
+				i += 2
+			} else {
+				out.WriteByte(s[i])
+				i++
+			}
 			continue
 		}
 
@@ -932,4 +990,70 @@ func ansiSafeTruncate(s string, maxWidth int) string {
 	}
 
 	return out.String()
+}
+
+func joinTabsWithinWidth(tabs []string, maxW int) string {
+	if maxW <= 0 || len(tabs) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	used := 0
+	sep := " "
+
+	for i, t := range tabs {
+		tw := lipgloss.Width(t)
+		addSep := i > 0
+		sepW := 0
+		if addSep {
+			sepW = lipgloss.Width(sep)
+		}
+
+		if used+sepW+tw > maxW {
+			ell := subtleStyle.Render("…")
+			ellW := lipgloss.Width(ell)
+			if used > 0 && used+sepW+ellW <= maxW {
+				out.WriteString(sep)
+				out.WriteString(ell)
+			} else if used == 0 && ellW <= maxW {
+				out.WriteString(ell)
+			}
+			break
+		}
+
+		if addSep {
+			out.WriteString(sep)
+			used += sepW
+		}
+
+		out.WriteString(t)
+		used += tw
+	}
+
+	return out.String()
+}
+
+func hardClipLinesToWidth(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = ansiSafeTruncate(lines[i], w)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	return s
+}
+
+func clampToWidthOneLine(s string, w int) string {
+	s = oneLine(s)
+	if w <= 0 {
+		return ""
+	}
+	return ansiSafeTruncate(s, w)
 }
