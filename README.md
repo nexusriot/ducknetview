@@ -40,11 +40,11 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
 
 ### Global
 
-| Key | Action |
-|-----|--------|
-| `←` `→` | Switch tabs |
+| Key                 | Action |
+|---------------------|--------|
+| `←` `→`             | Switch tabs |
 | `tab` / `shift+tab` | Cycle tabs |
-| `q` | Quit |
+| `ctrl+c`            | Quit |
 
 ### Lists / Viewports
 

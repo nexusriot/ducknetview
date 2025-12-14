@@ -253,8 +253,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			return m, tea.Quit
+		case "q":
+			return m, nil
 		case "tab":
 			m.activeTab = (m.activeTab + 1) % 4
 			return m, nil
@@ -278,6 +280,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsSearching = true
 				m.procsSearch.Focus()
 				m.procsSearch.SetValue(m.procsQuery)
+				return m, nil
+			}
+		case "ctrl+u":
+			if m.activeTab == tabPorts && !m.portsSearching {
+				m.portsQuery = ""
+				m.portsSearch.SetValue("")
+				m.portsText = m.renderPortsText()
+				m.portsVP.SetContent(m.portsText)
+				return m, nil
+			}
+			if m.activeTab == tabProcs && !m.procsSearching {
+				m.procsQuery = ""
+				m.procsSearch.SetValue("")
+				m.procsText = m.renderProcsText()
+				m.procsVP.SetContent(m.procsText)
 				return m, nil
 			}
 
@@ -388,7 +405,7 @@ func (m Model) View() string {
 		body = m.viewProcs()
 	}
 
-	footer := subtleStyle.Render("Keys: 1-4 tabs • tab/shift+tab • (Ports/Procs) ↑↓ PgUp/PgDn Home/End • q quit")
+	footer := subtleStyle.Render("Keys: tab/shift+tab • (Ports/Procs) ↑↓ PgUp/PgDn Home/End")
 	if m.err != nil {
 		footer = errStyle.Render("Error: " + m.err.Error())
 	}
@@ -473,7 +490,7 @@ func (m Model) viewPorts() string {
 	}
 	searchLine := subtleStyle.Render("Press / to search")
 	if m.portsQuery != "" {
-		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.portsQuery) + subtleStyle.Render("  (press / to change)")
+		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.portsQuery) + subtleStyle.Render("  (press / to change, ctrl+u to clear)")
 	}
 	if m.portsSearching {
 		searchLine = m.portsSearch.View()
@@ -488,15 +505,26 @@ func (m Model) viewProcs() string {
 	procsW := min(m.w-2, 120)
 	procsH := max(8, m.h-6)
 
+	// Reserve 2 lines for search UI inside the box
+	searchUIH := 2
 	m.procsVP.Width = max(10, procsW-2)
-	m.procsVP.Height = max(5, procsH-2)
+	m.procsVP.Height = max(5, (procsH-2)-searchUIH)
 
 	if m.procsText == "" {
 		m.procsText = m.renderProcsText()
 		m.procsVP.SetContent(m.procsText)
 	}
 
-	return boxStyle.Width(procsW).Height(procsH).Render(m.procsVP.View())
+	searchLine := subtleStyle.Render("Press / to search")
+	if m.procsQuery != "" {
+		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.procsQuery) + subtleStyle.Render("  (press / to change, ctrl+u to clear)")
+	}
+	if m.procsSearching {
+		searchLine = m.procsSearch.View()
+	}
+
+	content := searchLine + "\n\n" + m.procsVP.View()
+	return boxStyle.Width(procsW).Height(procsH).Render(content)
 }
 
 func (m Model) renderPortsText() string {
