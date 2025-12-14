@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -268,6 +269,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastSnap = probe.NetSnapshot(msg)
 		m.err = nil
 
+		// Preserve selection (glitch fix): SetItems can reset selection/scroll.
+		prevSel := m.selectedIface
+		prevIndex := m.ifaceList.Index()
+
 		items := make([]list.Item, 0, len(m.lastSnap.Ifaces))
 		for _, ii := range m.lastSnap.Ifaces {
 			desc := fmt.Sprintf("MAC %s  RX %s  TX %s",
@@ -279,10 +284,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.ifaceList.SetItems(items)
 
+		// Ensure we have a selected iface and restore list cursor.
 		if m.selectedIface == "" && len(m.lastSnap.Ifaces) > 0 {
 			m.selectedIface = m.lastSnap.Ifaces[0].Name
+			m.ifaceList.Select(0)
+		} else if prevSel != "" {
+			for idx, it := range items {
+				if ii, ok := it.(ifaceItem); ok && ii.name == prevSel {
+					m.ifaceList.Select(idx)
+					break
+				}
+			}
+		} else if len(items) > 0 {
+			// Fallback: restore previous index if possible
+			if prevIndex >= 0 && prevIndex < len(items) {
+				m.ifaceList.Select(prevIndex)
+				if it, ok := items[prevIndex].(ifaceItem); ok {
+					m.selectedIface = it.name
+				}
+			} else {
+				m.ifaceList.Select(0)
+				if it, ok := items[0].(ifaceItem); ok {
+					m.selectedIface = it.name
+				}
+			}
 		}
 
+		// Update histories for currently selected iface
 		for _, ii := range m.lastSnap.Ifaces {
 			if ii.Name == m.selectedIface {
 				m.rxHist = append(m.rxHist, ii.RxBps)
@@ -503,7 +531,7 @@ func (m Model) renderHeader() string {
 		renderTab("4 Processes", m.activeTab == tabProcs),
 	}
 
-	left := titleStyle.Render("ducknetview 🦆 0.0.3") + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
+	left := titleStyle.Render("ducknetview 🦆 0.0.4") + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
 	right := strings.Join(tabs, " ")
 
 	rem := m.w - lipgloss.Width(left)
@@ -511,7 +539,7 @@ func (m Model) renderHeader() string {
 		rem = 0
 	}
 
-	// Make header ALWAYS single-line: truncate right part to remaining width.
+	// Make header ALWAYS single-line: truncate right part to remaining width (ANSI-safe).
 	right = fitToWidth(right, rem)
 
 	line := left + padTo(rem, right)
@@ -804,11 +832,7 @@ func fitToWidth(s string, w int) string {
 	if w <= 0 {
 		return ""
 	}
-	if lipgloss.Width(s) <= w {
-		return s
-	}
-	// Uses your existing trunc() helper (keeps the rest of the project consistent).
-	return trunc(s, w)
+	return ansiSafeTruncate(s, w)
 }
 
 func padTo(width int, s string) string {
@@ -860,9 +884,52 @@ func highlightFold(s, q string) string {
 		j += i
 		out.WriteString(s[i:j])
 		out.WriteString("\x1b[7m")
+		// NOTE: keep your previous behavior; if you want perfect case-insensitive
+		// highlighting for non-ASCII, we can switch to rune-aware matching later.
 		out.WriteString(s[j : j+len(q)])
 		out.WriteString("\x1b[0m")
 		i = j + len(q)
 	}
+	return out.String()
+}
+func ansiSafeTruncate(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	visible := 0
+
+	for i := 0; i < len(s); {
+		// ANSI escape sequence
+		if s[i] == '\x1b' {
+			end := i + 1
+			for end < len(s) && s[end] != 'm' {
+				end++
+			}
+			if end < len(s) {
+				end++ // include 'm'
+			}
+			out.WriteString(s[i:end])
+			i = end
+			continue
+		}
+
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			i++
+			continue
+		}
+
+		w := lipgloss.Width(string(r))
+		if visible+w > maxWidth {
+			break
+		}
+
+		out.WriteRune(r)
+		visible += w
+		i += size
+	}
+
 	return out.String()
 }
