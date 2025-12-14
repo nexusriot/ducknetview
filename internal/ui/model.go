@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -21,12 +23,25 @@ const (
 	tabIfaces
 	tabPorts
 	tabProcs
+	headerH = 1
+	footerH = 1
 )
 
 type tickMsg time.Time
 
+type extIPTickMsg time.Time
+
+type externalIPMsg struct {
+	ip  string
+	err error
+}
+
 func tickEvery(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func extIPTickEvery(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg { return extIPTickMsg(t) })
 }
 
 type ifaceItem struct {
@@ -71,9 +86,12 @@ type Model struct {
 	portsSearching bool
 	portsQuery     string
 
-	procsSearch    textinput.Model
-	procsSearching bool
-	procsQuery     string
+	procsSearch         textinput.Model
+	procsSearching      bool
+	procsQuery          string
+	externalIP          string
+	externalIPErr       error
+	externalIPUpdatedAt time.Time
 }
 
 func NewModel() Model {
@@ -115,6 +133,8 @@ func (m Model) Init() tea.Cmd {
 		m.refreshCmd(),
 		fetchPortsCmd(),
 		fetchProcsCmd(),
+		fetchExternalIPCmd(),
+		extIPTickEvery(30*time.Second),
 		tickEvery(1*time.Second),
 	)
 }
@@ -144,6 +164,46 @@ func fetchPortsCmd() tea.Cmd {
 	}
 }
 
+func fetchExternalIPCmd() tea.Cmd {
+	return func() tea.Msg {
+		const url = "https://api.ipify.org"
+
+		// refresh transport every time
+		tr := &http.Transport{
+			Proxy:               http.ProxyFromEnvironment,
+			DisableKeepAlives:   true,
+			TLSHandshakeTimeout: 3 * time.Second,
+		}
+
+		c := &http.Client{
+			Timeout:   4 * time.Second,
+			Transport: tr,
+		}
+
+		resp, err := c.Get(url)
+		if err != nil {
+			return externalIPMsg{"", err}
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return externalIPMsg{"", fmt.Errorf("external ip: http %d", resp.StatusCode)}
+		}
+
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+		if err != nil {
+			return externalIPMsg{"", err}
+		}
+
+		ip := strings.TrimSpace(string(b))
+		if ip == "" {
+			return externalIPMsg{"", fmt.Errorf("external ip: empty response")}
+		}
+
+		return externalIPMsg{ip: ip, err: nil}
+	}
+}
+
 func fetchProcsCmd() tea.Cmd {
 	return func() tea.Msg {
 		procs, err := probe.TopProcsByConnections(80)
@@ -162,7 +222,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Layout sizing
 		leftW := max(26, m.w/3)
-		bodyH := max(8, m.h-6)
+		bodyH := max(8, m.h-headerH-footerH-2)
 
 		m.ifaceList.SetSize(leftW, bodyH)
 
@@ -185,15 +245,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		return m, nil
 
+	case externalIPMsg:
+		if msg.err != nil {
+			m.externalIPErr = msg.err
+			return m, nil
+		}
+		m.externalIP = msg.ip
+		m.externalIPErr = nil
+		m.externalIPUpdatedAt = time.Now()
+		return m, nil
+
 	case tickMsg:
-		// refresh snapshot every second
 		cmds := []tea.Cmd{m.refreshCmd(), tickEvery(1 * time.Second)}
 
-		// refresh ports & procs every 5 seconds
 		if time.Now().Unix()%5 == 0 {
 			cmds = append(cmds, fetchPortsCmd(), fetchProcsCmd())
 		}
 		return m, tea.Batch(cmds...)
+
+	case extIPTickMsg:
+		return m, tea.Batch(
+			fetchExternalIPCmd(),
+			extIPTickEvery(30*time.Second),
+		)
 
 	case snapMsg:
 		m.lastSnap = probe.NetSnapshot(msg)
@@ -297,7 +371,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsVP.SetContent(m.procsText)
 				return m, nil
 			}
-
+		case "e":
+			return m, fetchExternalIPCmd()
 		}
 	}
 
@@ -305,11 +380,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.ifaceList, cmd = m.ifaceList.Update(msg)
 
+		needExtRefresh := false
+
 		// Auto-follow selection
 		if it, ok := m.ifaceList.SelectedItem().(ifaceItem); ok {
 			if m.selectedIface != it.name {
 				m.selectedIface = it.name
 				m.rxHist, m.txHist = nil, nil
+				needExtRefresh = true
 
 				m.ifaceDetailsText = m.renderIfaceDetailsText()
 				m.ifaceDetailsVP.SetContent(m.ifaceDetailsText)
@@ -320,6 +398,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd2 tea.Cmd
 		m.ifaceDetailsVP, cmd2 = m.ifaceDetailsVP.Update(msg)
 
+		if needExtRefresh {
+			return m, tea.Batch(cmd, cmd2, fetchExternalIPCmd())
+		}
 		return m, tea.Batch(cmd, cmd2)
 	}
 
@@ -369,6 +450,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsSearch.SetValue("")
 				return m, cmd
 			}
+
 		}
 		return m, cmd
 	}
@@ -461,12 +543,33 @@ func (m Model) viewOverview() string {
 	b.WriteString(titleStyle.Render("Selected interface") + "\n")
 	b.WriteString(m.renderIfaceDetailsText())
 
+	ext := m.externalIP
+	if ext == "" {
+		ext = "…"
+	}
+
+	line := fmt.Sprintf("External IP: %s", ext)
+	if !m.externalIPUpdatedAt.IsZero() {
+		line += fmt.Sprintf("  (updated %s)", m.externalIPUpdatedAt.Format("15:04:05"))
+	}
+	b.WriteString(line + "\n")
+
+	if m.externalIPErr != nil {
+		b.WriteString(fmt.Sprintf("External IP error: %s\n", subtleStyle.Render(m.externalIPErr.Error())))
+	}
+
+	//b.WriteString(fmt.Sprintf("External IP: %s\n", ext))
+
+	if m.externalIPErr != nil && m.externalIP == "" {
+		b.WriteString(fmt.Sprintf("External IP: %s\n", subtleStyle.Render("unavailable")))
+	}
 	return boxStyle.Width(min(m.w-2, 120)).Height(max(8, m.h-6)).Render(b.String())
 }
 
 func (m Model) viewIfaces() string {
 	leftW := max(26, m.w/3)
-	bodyH := max(8, m.h-6)
+	bodyH := max(8, m.h-headerH-footerH-2)
+
 	left := boxStyle.Width(leftW).Height(bodyH).Render(m.ifaceList.View())
 
 	rightW := m.w - leftW - 3
