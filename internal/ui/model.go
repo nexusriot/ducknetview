@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -46,21 +47,24 @@ type Model struct {
 	lastSnap probe.NetSnapshot
 	err      error
 
-	ifaceList     list.Model
-	selectedIface string
+	// Interfaces list + selection
+	ifaceList      list.Model
+	selectedIface  string
+	rxHist, txHist []float64
 
-	// history for selected iface
-	rxHist []float64
-	txHist []float64
+	// Ports / procs data
+	ports []probe.ListenPort
+	procs []probe.ProcNet
 
-	ports        []probe.ListenPort
-	procs        []probe.ProcNet
-	pickingIface bool
-	showDown     bool
-	showLoop     bool
-	showBridges  bool
-	showVeth     bool
-	showDocker   bool
+	// Viewports for scrolling
+	portsVP   viewport.Model
+	portsText string
+
+	procsVP   viewport.Model
+	procsText string
+
+	ifaceDetailsVP   viewport.Model
+	ifaceDetailsText string
 }
 
 func NewModel() Model {
@@ -68,41 +72,30 @@ func NewModel() Model {
 	ls.Title = "Interfaces"
 	ls.SetShowHelp(false)
 
+	// viewports (sizes are set on WindowSizeMsg)
+	pvp := viewport.New(0, 0)
+	kvp := viewport.New(0, 0)
+	dvp := viewport.New(0, 0)
+
 	return Model{
-		activeTab:   tabOverview,
-		netSampler:  probe.NewNetSampler(),
-		ifaceList:   ls,
-		showDown:    false,
-		showLoop:    false,
-		showBridges: false,
-		showVeth:    false,
-		showDocker:  false,
+		activeTab:  tabOverview,
+		netSampler: probe.NewNetSampler(),
+
+		ifaceList: ls,
+
+		portsVP:        pvp,
+		procsVP:        kvp,
+		ifaceDetailsVP: dvp,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.refreshCmd(),
+		fetchPortsCmd(),
+		fetchProcsCmd(),
 		tickEvery(1*time.Second),
 	)
-}
-
-func (m Model) ifaceVisible(ii probe.IfaceInfo) bool {
-	if !m.showDown && !ii.IsUp {
-		return false
-	}
-	switch ii.Kind {
-	case probe.IfaceLoopback:
-		return m.showLoop
-	case probe.IfaceLinuxBridge:
-		return m.showBridges
-	case probe.IfaceVeth:
-		return m.showVeth
-	case probe.IfaceDockerBridge:
-		return m.showDocker
-	default:
-		return true
-	}
 }
 
 func (m Model) refreshCmd() tea.Cmd {
@@ -129,9 +122,10 @@ func fetchPortsCmd() tea.Cmd {
 		return portsMsg(ports)
 	}
 }
+
 func fetchProcsCmd() tea.Cmd {
 	return func() tea.Msg {
-		procs, err := probe.TopProcsByConnections(30)
+		procs, err := probe.TopProcsByConnections(80)
 		if err != nil {
 			return errMsg{err}
 		}
@@ -140,22 +134,41 @@ func fetchProcsCmd() tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-
-	if m.pickingIface {
-		return m.updateIfacePicker(msg)
-	}
-
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
-		m.ifaceList.SetSize(max(20, m.w/3), max(8, m.h-10))
+
+		// Layout sizing
+		leftW := max(26, m.w/3)
+		bodyH := max(8, m.h-6)
+
+		m.ifaceList.SetSize(leftW, bodyH)
+
+		// Ports viewport inside a bordered box with padding(0,1) => subtract ~2
+		portsW := min(m.w-2, 120)
+		portsH := bodyH
+		m.portsVP.Width = max(10, portsW-2)
+		m.portsVP.Height = max(5, portsH-2)
+
+		// Procs viewport
+		procsW := min(m.w-2, 120)
+		procsH := bodyH
+		m.procsVP.Width = max(10, procsW-2)
+		m.procsVP.Height = max(5, procsH-2)
+
+		// Iface details viewport (right panel)
+		rightW := m.w - leftW - 3
+		m.ifaceDetailsVP.Width = max(10, rightW-2)
+		m.ifaceDetailsVP.Height = max(5, bodyH-2)
+
 		return m, nil
 
 	case tickMsg:
-		// refresh net snapshot every second
+		// refresh snapshot every second
 		cmds := []tea.Cmd{m.refreshCmd(), tickEvery(1 * time.Second)}
-		// refresh ports/procs less often
+
+		// refresh ports & procs every 5 seconds
 		if time.Now().Unix()%5 == 0 {
 			cmds = append(cmds, fetchPortsCmd(), fetchProcsCmd())
 		}
@@ -165,13 +178,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastSnap = probe.NetSnapshot(msg)
 		m.err = nil
 
-		// update iface list
+		// build interface list
 		items := make([]list.Item, 0, len(m.lastSnap.Ifaces))
 		for _, ii := range m.lastSnap.Ifaces {
-
-			if !m.ifaceVisible(ii) {
-				continue
-			}
 			desc := fmt.Sprintf("MAC %s  RX %s  TX %s",
 				ii.Hardware,
 				probe.HumanBytesPerSec(ii.RxBps),
@@ -181,43 +190,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.ifaceList.SetItems(items)
 
-		if m.selectedIface != "" {
-			found := false
-			for _, ii := range m.lastSnap.Ifaces {
-				if ii.Name == m.selectedIface {
-					found = true
-					break
-				}
-			}
-			if !found && len(m.lastSnap.Ifaces) > 0 {
-				m.selectedIface = m.lastSnap.Ifaces[0].Name
-			}
-		}
-
 		// default selected iface
 		if m.selectedIface == "" && len(m.lastSnap.Ifaces) > 0 {
 			m.selectedIface = m.lastSnap.Ifaces[0].Name
 		}
 
-		// update history for selected iface
+		// Update hist for currently selected iface
 		for _, ii := range m.lastSnap.Ifaces {
 			if ii.Name == m.selectedIface {
 				m.rxHist = append(m.rxHist, ii.RxBps)
 				m.txHist = append(m.txHist, ii.TxBps)
-				m.rxHist = probe.ClampHistory(m.rxHist, max(10, m.w/2))
-				m.txHist = probe.ClampHistory(m.txHist, max(10, m.w/2))
+
+				maxHist := max(30, min(200, m.w/2))
+				m.rxHist = probe.ClampHistory(m.rxHist, maxHist)
+				m.txHist = probe.ClampHistory(m.txHist, maxHist)
 				break
 			}
 		}
+
+		// update iface details viewport content
+		m.ifaceDetailsText = m.renderIfaceDetailsText()
+		m.ifaceDetailsVP.SetContent(m.ifaceDetailsText)
 
 		return m, nil
 
 	case portsMsg:
 		m.ports = []probe.ListenPort(msg)
+		m.portsText = m.renderPortsText()
+		m.portsVP.SetContent(m.portsText)
 		return m, nil
 
 	case procsMsg:
 		m.procs = []probe.ProcNet(msg)
+		m.procsText = m.renderProcsText()
+		m.procsVP.SetContent(m.procsText)
 		return m, nil
 
 	case errMsg:
@@ -246,64 +252,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "4":
 			m.activeTab = tabProcs
 			return m, nil
-		case "i":
-			m.pickingIface = !m.pickingIface
+		case "right":
+			m.activeTab = (m.activeTab + 1) % 4
 			return m, nil
-		case "d":
-			m.showDown = !m.showDown
-			return m, nil
-		case "l":
-			m.showLoop = !m.showLoop
-			return m, nil
-		case "b":
-			m.showBridges = !m.showBridges
-			return m, nil
-		case "v":
-			m.showVeth = !m.showVeth
-			return m, nil
-		case "o": // docker
-			m.showDocker = !m.showDocker
+		case "left":
+			m.activeTab = (m.activeTab + 3) % 4
 			return m, nil
 
 		}
+
 	}
 
-	// allow list navigation only on iface tab
 	if m.activeTab == tabIfaces {
 		var cmd tea.Cmd
 		m.ifaceList, cmd = m.ifaceList.Update(msg)
 
-		// enter selects interface
-		if km, ok := msg.(tea.KeyMsg); ok && km.String() == "enter" {
-			if it, ok := m.ifaceList.SelectedItem().(ifaceItem); ok {
+		// Auto-follow selection
+		if it, ok := m.ifaceList.SelectedItem().(ifaceItem); ok {
+			if m.selectedIface != it.name {
 				m.selectedIface = it.name
-				m.rxHist = nil
-				m.txHist = nil
+				m.rxHist, m.txHist = nil, nil
+
+				m.ifaceDetailsText = m.renderIfaceDetailsText()
+				m.ifaceDetailsVP.SetContent(m.ifaceDetailsText)
 			}
 		}
+
+		// Allow scrolling inside right details panel (if content long)
+		var cmd2 tea.Cmd
+		m.ifaceDetailsVP, cmd2 = m.ifaceDetailsVP.Update(msg)
+
+		return m, tea.Batch(cmd, cmd2)
+	}
+
+	// Ports tab: scroll via viewport
+	if m.activeTab == tabPorts {
+		var cmd tea.Cmd
+		m.portsVP, cmd = m.portsVP.Update(msg)
+		return m, cmd
+	}
+
+	// Procs tab: scroll via viewport
+	if m.activeTab == tabProcs {
+		var cmd tea.Cmd
+		m.procsVP, cmd = m.procsVP.Update(msg)
 		return m, cmd
 	}
 
 	return m, nil
-}
-
-func (m Model) updateIfacePicker(msg tea.Msg) (Model, tea.Cmd) {
-	var cmd tea.Cmd
-	m.ifaceList, cmd = m.ifaceList.Update(msg)
-
-	if km, ok := msg.(tea.KeyMsg); ok {
-		switch km.String() {
-		case "enter":
-			if it, ok := m.ifaceList.SelectedItem().(ifaceItem); ok {
-				m.selectedIface = it.name
-				m.rxHist, m.txHist = nil, nil
-			}
-			m.pickingIface = false
-		case "esc":
-			m.pickingIface = false
-		}
-	}
-	return m, cmd
 }
 
 func (m Model) View() string {
@@ -321,8 +317,7 @@ func (m Model) View() string {
 		body = m.viewProcs()
 	}
 
-	footer := subtleStyle.Render("Keys: 1-4 tabs • i pick iface • d/l/b/v/o filters • q quit")
-
+	footer := subtleStyle.Render("Keys: 1-4 tabs • tab/shift+tab • (Ports/Procs) ↑↓ PgUp/PgDn Home/End • q quit")
 	if m.err != nil {
 		footer = errStyle.Render("Error: " + m.err.Error())
 	}
@@ -337,7 +332,7 @@ func (m Model) renderHeader() string {
 		renderTab("3 Ports", m.activeTab == tabPorts),
 		renderTab("4 Processes", m.activeTab == tabProcs),
 	}
-	left := titleStyle.Render("ducknetview🦆 0.0.2 PoC") + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
+	left := titleStyle.Render("ducknetview 🦆 0.0.3") + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
 	right := strings.Join(tabs, " ")
 	line := lipgloss.NewStyle().Width(m.w).Render(left + padTo(m.w-lipgloss.Width(left), right))
 	return line
@@ -355,73 +350,186 @@ func (m Model) viewOverview() string {
 		return boxStyle.Render("Collecting data…")
 	}
 
-	var shown int
+	up, down := 0, 0
 	for _, ii := range m.lastSnap.Ifaces {
-		if m.ifaceVisible(ii) {
-			shown++
+		if ii.IsUp {
+			up++
+		} else {
+			down++
 		}
 	}
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Host: %s\n", okStyle.Render(m.lastSnap.Hostname)))
 	b.WriteString(fmt.Sprintf("Uptime: %s\n", m.lastSnap.Uptime.Truncate(time.Second)))
-	b.WriteString(fmt.Sprintf("Iface: %s  (press %s to change)\n",
-		titleStyle.Render(m.selectedIface),
-		subtleStyle.Render("i"),
-	))
-	b.WriteString(fmt.Sprintf("Interfaces: total %d, shown %d\n\n", len(m.lastSnap.Ifaces), shown))
-
-	// print only selected iface
-	var sel *probe.IfaceInfo
-	for k := range m.lastSnap.Ifaces {
-		if m.lastSnap.Ifaces[k].Name == m.selectedIface {
-			sel = &m.lastSnap.Ifaces[k]
-			break
-		}
-	}
-	if sel == nil {
-		b.WriteString("Selected interface not found.\n")
-		return boxStyle.Width(min(m.w-2, 120)).Render(b.String())
-	}
-
-	state := "DOWN"
-	st := subtleStyle
-	if sel.IsUp {
-		state = "UP"
-		st = okStyle
-	}
-	b.WriteString(fmt.Sprintf("%s %s  MTU %d  MAC %s\n", st.Render(state), titleStyle.Render(sel.Name), sel.MTU, sel.Hardware))
-	if len(sel.Addrs) > 0 {
-		b.WriteString("  addrs: " + strings.Join(sel.Addrs, ", ") + "\n")
-	}
-	b.WriteString(fmt.Sprintf("  RX %s  TX %s\n\n",
-		probe.HumanBytesPerSec(sel.RxBps),
-		probe.HumanBytesPerSec(sel.TxBps),
+	b.WriteString(fmt.Sprintf("Time: %s\n", m.lastSnap.TakenAt.Format("2006-01-02 15:04:05 -07:00")))
+	b.WriteString(fmt.Sprintf("Ifaces: %d total  (%s up, %s down)\n\n",
+		len(m.lastSnap.Ifaces),
+		okStyle.Render(fmt.Sprintf("%d", up)),
+		subtleStyle.Render(fmt.Sprintf("%d", down)),
 	))
 
-	// add mini charts here too
-	chartW := max(30, min(80, m.w-20))
-	b.WriteString("  RX " + Spark(m.rxHist, chartW) + "\n")
-	b.WriteString("  TX " + Spark(m.txHist, chartW) + "\n")
+	// Selected interface card (same as right panel)
+	b.WriteString(titleStyle.Render("Selected interface") + "\n")
+	b.WriteString(m.renderIfaceDetailsText())
 
-	// optional: show filter hints
-	b.WriteString("\n")
-	b.WriteString(subtleStyle.Render("Filters: d=down l=loop b=bridge v=veth o=docker (toggle)\n"))
-
-	content := boxStyle.Width(min(m.w-2, 120)).Render(b.String())
-
-	// if picker open, draw it under overview
-	if m.pickingIface {
-		p := boxStyle.Width(min(m.w-2, 120)).Render("Select interface (↑↓ enter, esc)\n\n" + m.ifaceList.View())
-		return lipgloss.JoinVertical(lipgloss.Left, content, p)
-	}
-	return content
+	return boxStyle.Width(min(m.w-2, 120)).Height(max(8, m.h-6)).Render(b.String())
 }
 
 func (m Model) viewIfaces() string {
-	left := boxStyle.Width(max(24, m.w/3)).Height(max(8, m.h-6)).Render(m.ifaceList.View())
+	leftW := max(26, m.w/3)
+	bodyH := max(8, m.h-6)
+	left := boxStyle.Width(leftW).Height(bodyH).Render(m.ifaceList.View())
 
-	// right side: selected iface + mini chart
+	rightW := m.w - leftW - 3
+	m.ifaceDetailsVP.Width = max(10, rightW-2)
+	m.ifaceDetailsVP.Height = max(5, bodyH-2)
+
+	right := boxStyle.Width(rightW).Height(bodyH).Render(m.ifaceDetailsVP.View())
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+}
+
+func (m Model) viewPorts() string {
+	portsW := min(m.w-2, 120)
+	portsH := max(8, m.h-6)
+
+	m.portsVP.Width = max(10, portsW-2)
+	m.portsVP.Height = max(5, portsH-2)
+
+	if m.portsText == "" {
+		m.portsText = m.renderPortsText()
+		m.portsVP.SetContent(m.portsText)
+	}
+
+	return boxStyle.Width(portsW).Height(portsH).Render(m.portsVP.View())
+}
+
+func (m Model) viewProcs() string {
+	procsW := min(m.w-2, 120)
+	procsH := max(8, m.h-6)
+
+	m.procsVP.Width = max(10, procsW-2)
+	m.procsVP.Height = max(5, procsH-2)
+
+	if m.procsText == "" {
+		m.procsText = m.renderProcsText()
+		m.procsVP.SetContent(m.procsText)
+	}
+
+	return boxStyle.Width(procsW).Height(procsH).Render(m.procsVP.View())
+}
+
+func (m Model) renderPortsText() string {
+	var b strings.Builder
+
+	w := m.portsVP.Width
+	if w <= 0 {
+		w = 120
+	}
+
+	colProto := 4
+	colLocal := min(38, max(18, w-4-2-7-1-12))
+	colPID := 7
+
+	b.WriteString("Open listening ports\n")
+	b.WriteString("Scroll: ↑↓ PgUp/PgDn Home/End\n\n")
+
+	hProto := padRight("PR", colProto)
+	hLocal := padRight("LOCAL", colLocal)
+	hPID := padRight("PID", colPID)
+	hProc := "PROCESS"
+	b.WriteString(fmt.Sprintf("%s  %s  %s %s\n", hProto, hLocal, hPID, hProc))
+	b.WriteString(strings.Repeat("─", min(w, colProto+2+colLocal+2+colPID+1+len(hProc))) + "\n")
+
+	if len(m.ports) == 0 {
+		b.WriteString("No data (yet)…\n")
+		return b.String()
+	}
+
+	for _, p := range m.ports {
+		proc := p.Process
+		if proc == "" {
+			proc = "-"
+		}
+
+		local := p.Local
+		if local == ":" || local == "0.0.0.0:0" {
+			local = "-"
+		}
+
+		proto := padRight(trunc(p.Proto, colProto), colProto)
+		local = padRight(trunc(local, colLocal), colLocal)
+		pid := padRight(fmt.Sprintf("%d", p.PID), colPID)
+
+		rest := w - (colProto + 2 + colLocal + 2 + colPID + 1)
+		if rest < 5 {
+			rest = 5
+		}
+		proc = trunc(proc, rest)
+
+		b.WriteString(fmt.Sprintf("%s  %s  %s %s\n", proto, local, pid, proc))
+	}
+
+	return b.String()
+}
+
+func (m Model) renderProcsText() string {
+	var b strings.Builder
+
+	w := m.procsVP.Width
+	if w <= 0 {
+		w = 120
+	}
+
+	colPID := 7
+	colConns := 6
+	colListen := 6
+
+	minName := 16
+	colName := w - (colPID + 2 + colConns + 2 + colListen)
+	if colName < minName {
+		colName = minName
+	}
+	if colName > 40 {
+		colName = 40
+	}
+
+	b.WriteString("Processes by network connections (proxy)\n")
+	b.WriteString("Scroll: ↑↓ PgUp/PgDn Home/End\n\n")
+
+	h := fmt.Sprintf("%s  %s  %s  %s\n",
+		padRight("PID", colPID),
+		padRight("NAME", colName),
+		padRight("CONNS", colConns),
+		padRight("LISTEN", colListen),
+	)
+	b.WriteString(h)
+	b.WriteString(strings.Repeat("─", min(w, colPID+2+colName+2+colConns+2+colListen)) + "\n")
+
+	if len(m.procs) == 0 {
+		b.WriteString("No data (yet)…\n")
+		return b.String()
+	}
+
+	for _, p := range m.procs {
+		name := p.Name
+		if name == "" {
+			name = "-"
+		}
+
+		line := fmt.Sprintf("%s  %s  %s  %s\n",
+			padRight(trunc(fmt.Sprintf("%d", p.PID), colPID), colPID),
+			padRight(trunc(name, colName), colName),
+			padRight(trunc(fmt.Sprintf("%d", p.ConnCount), colConns), colConns),
+			padRight(trunc(fmt.Sprintf("%d", p.ListenCount), colListen), colListen),
+		)
+		b.WriteString(line)
+	}
+
+	return b.String()
+}
+
+func (m Model) renderIfaceDetailsText() string {
 	var ii *probe.IfaceInfo
 	for k := range m.lastSnap.Ifaces {
 		if m.lastSnap.Ifaces[k].Name == m.selectedIface {
@@ -429,73 +537,31 @@ func (m Model) viewIfaces() string {
 			break
 		}
 	}
-
-	rightContent := "Select an interface…"
-	if ii != nil {
-		width := max(20, m.w-(m.w/3)-6)
-		chartW := max(20, width-10)
-		rx := Spark(m.rxHist, chartW)
-		tx := Spark(m.txHist, chartW)
-
-		rightContent = fmt.Sprintf(
-			"%s\nMAC: %s\nAddrs: %s\n\nRX: %s\n%s\n\nTX: %s\n%s\n",
-			titleStyle.Render("Monitoring: "+ii.Name),
-			ii.Hardware,
-			strings.Join(ii.Addrs, ", "),
-			probe.HumanBytesPerSec(ii.RxBps),
-			rx,
-			probe.HumanBytesPerSec(ii.TxBps),
-			tx,
-		)
+	if ii == nil {
+		return "Select an interface…\n"
 	}
 
-	right := boxStyle.Width(m.w - max(24, m.w/3) - 3).Height(max(8, m.h-6)).Render(rightContent)
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-}
+	state := "DOWN"
+	st := subtleStyle
+	if ii.IsUp {
+		state = "UP"
+		st = okStyle
+	}
 
-func (m Model) viewPorts() string {
+	chartW := max(30, min(80, m.w/2))
+	rx := Spark(m.rxHist, chartW)
+	tx := Spark(m.txHist, chartW)
+
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("Open listening ports") + "\n")
-	b.WriteString(subtleStyle.Render("Note: PID/process mapping may require elevated permissions.\n\n"))
-
-	if len(m.ports) == 0 {
-		b.WriteString("No data (yet)…\n")
-	} else {
-		for _, p := range m.ports {
-			proc := p.Process
-			if proc == "" {
-				proc = "-"
-			}
-			b.WriteString(fmt.Sprintf("%-4s %-22s pid=%-6d %s\n", p.Proto, p.Local, p.PID, proc))
-		}
+	b.WriteString(fmt.Sprintf("%s %s  MTU %d\n", st.Render(state), titleStyle.Render(ii.Name), ii.MTU))
+	b.WriteString(fmt.Sprintf("MAC: %s\n", ii.Hardware))
+	if len(ii.Addrs) > 0 {
+		b.WriteString("Addrs: " + strings.Join(ii.Addrs, ", ") + "\n")
 	}
-
-	return boxStyle.Width(min(m.w-2, 120)).Height(max(8, m.h-6)).Render(b.String())
-}
-
-func (m Model) viewProcs() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("Processes by network connections (proxy for activity)") + "\n")
-	b.WriteString(subtleStyle.Render("For true per-process bandwidth, consider eBPF/netlink accounting.\n\n"))
-
-	if len(m.procs) == 0 {
-		b.WriteString("No data (yet)…\n")
-	} else {
-		b.WriteString(fmt.Sprintf("%-7s %-28s %-10s %-10s\n", "PID", "NAME", "CONNS", "LISTEN"))
-		b.WriteString(strings.Repeat("─", 64) + "\n")
-		for _, p := range m.procs {
-			name := p.Name
-			if name == "" {
-				name = "-"
-			}
-			if len(name) > 28 {
-				name = name[:28]
-			}
-			b.WriteString(fmt.Sprintf("%-7d %-28s %-10d %-10d\n", p.PID, name, p.ConnCount, p.ListenCount))
-		}
-	}
-
-	return boxStyle.Width(min(m.w-2, 120)).Height(max(8, m.h-6)).Render(b.String())
+	b.WriteString("\n")
+	b.WriteString(fmt.Sprintf("RX: %s\n%s\n\n", probe.HumanBytesPerSec(ii.RxBps), rx))
+	b.WriteString(fmt.Sprintf("TX: %s\n%s\n", probe.HumanBytesPerSec(ii.TxBps), tx))
+	return b.String()
 }
 
 // helpers
