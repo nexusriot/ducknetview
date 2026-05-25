@@ -24,8 +24,10 @@ const (
 	tabIfaces
 	tabPorts
 	tabProcs
-	headerH = 1
-	footerH = 1
+	tabConns
+	headerH  = 1
+	footerH  = 1
+	tabCount = 5
 )
 
 type tickMsg time.Time
@@ -67,9 +69,10 @@ type Model struct {
 	selectedIface  string
 	rxHist, txHist []float64
 
-	// Ports / procs
+	// Ports / procs / conns
 	ports []probe.ListenPort
 	procs []probe.ProcNet
+	conns []probe.Conn
 
 	// Viewports
 	portsVP   viewport.Model
@@ -77,6 +80,9 @@ type Model struct {
 
 	procsVP   viewport.Model
 	procsText string
+
+	connsVP   viewport.Model
+	connsText string
 
 	ifaceDetailsVP   viewport.Model
 	ifaceDetailsText string
@@ -88,6 +94,16 @@ type Model struct {
 	procsSearch    textinput.Model
 	procsSearching bool
 	procsQuery     string
+
+	connsSearch    textinput.Model
+	connsSearching bool
+	connsQuery     string
+
+	// Conns extras
+	connsRevDNS bool
+	connsGroup  bool
+	dnsCache    map[string]string // ip -> hostname (empty string means resolved but no PTR)
+	dnsTried    map[string]bool   // ip -> already attempted (don't retry within session)
 
 	externalIP          string
 	externalIPErr       error
@@ -103,6 +119,7 @@ func NewModel() Model {
 	pvp := viewport.New(0, 0)
 	kvp := viewport.New(0, 0)
 	dvp := viewport.New(0, 0)
+	cvp := viewport.New(0, 0)
 
 	ps := textinput.New()
 	ps.Placeholder = "search port / address / process"
@@ -114,6 +131,11 @@ func NewModel() Model {
 	qs.Prompt = "/ "
 	qs.CharLimit = 64
 
+	cs := textinput.New()
+	cs.Placeholder = "search local / remote / process / state"
+	cs.Prompt = "/ "
+	cs.CharLimit = 64
+
 	return Model{
 		activeTab:  tabOverview,
 		netSampler: probe.NewNetSampler(),
@@ -122,9 +144,11 @@ func NewModel() Model {
 
 		portsVP:        pvp,
 		procsVP:        kvp,
+		connsVP:        cvp,
 		ifaceDetailsVP: dvp,
 		portsSearch:    ps,
 		procsSearch:    qs,
+		connsSearch:    cs,
 	}
 }
 
@@ -133,6 +157,7 @@ func (m Model) Init() tea.Cmd {
 		m.refreshCmd(),
 		fetchPortsCmd(),
 		fetchProcsCmd(),
+		fetchConnsCmd(),
 		fetchExternalIPCmd(),
 		extIPTickEvery(30*time.Second),
 		tickEvery(1*time.Second),
@@ -159,6 +184,7 @@ type errMsg struct{ error }
 type snapMsg probe.NetSnapshot
 type portsMsg []probe.ListenPort
 type procsMsg []probe.ProcNet
+type connsMsg []probe.Conn
 
 func fetchPortsCmd() tea.Cmd {
 	return func() tea.Msg {
@@ -177,6 +203,16 @@ func fetchProcsCmd() tea.Cmd {
 			return errMsg{err}
 		}
 		return procsMsg(procs)
+	}
+}
+
+func fetchConnsCmd() tea.Cmd {
+	return func() tea.Msg {
+		cs, err := probe.ListConnections()
+		if err != nil {
+			return errMsg{err}
+		}
+		return connsMsg(cs)
 	}
 }
 
@@ -244,6 +280,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.procsVP.Width = max(10, procsW-2)
 		m.procsVP.Height = max(5, bodyH-4)
 
+		// Conns
+		connsW := min(m.w-2, 160)
+		m.connsVP.Width = max(10, connsW-2)
+		m.connsVP.Height = max(5, bodyH-4)
+
 		// Interfaces right
 		rightW := m.w - leftW - 3
 		m.ifaceDetailsVP.Width = max(10, rightW-2)
@@ -257,6 +298,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 		m.procsVP.SetContent(
 			hardClipLinesToWidth(m.procsText, m.procsVP.Width),
+		)
+		m.connsVP.SetContent(
+			hardClipLinesToWidth(m.connsText, m.connsVP.Width),
 		)
 
 		return m, nil
@@ -274,7 +318,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		cmds := []tea.Cmd{m.refreshCmd(), tickEvery(1 * time.Second)}
 		if time.Now().Unix()%5 == 0 {
-			cmds = append(cmds, fetchPortsCmd(), fetchProcsCmd())
+			cmds = append(cmds, fetchPortsCmd(), fetchProcsCmd(), fetchConnsCmd())
 		}
 		return m, tea.Batch(cmds...)
 
@@ -363,6 +407,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.procsVP.SetContent(m.procsText)
 		return m, nil
 
+	case connsMsg:
+		m.conns = msg
+		cmds := m.kickConnLookups()
+		m.connsText = m.renderConnsText()
+		m.connsText = hardClipLinesToWidth(m.connsText, m.connsVP.Width)
+		m.connsVP.SetContent(m.connsText)
+		if len(cmds) > 0 {
+			return m, tea.Batch(cmds...)
+		}
+		return m, nil
+
+	case dnsMsg:
+		if m.dnsCache == nil {
+			m.dnsCache = map[string]string{}
+		}
+		m.dnsCache[msg.ip] = msg.name
+		if m.activeTab == tabConns {
+			m.connsText = m.renderConnsText()
+			m.connsText = hardClipLinesToWidth(m.connsText, m.connsVP.Width)
+			m.connsVP.SetContent(m.connsText)
+		}
+		return m, nil
+
 	case errMsg:
 		m.err = msg.error
 		return m, nil
@@ -375,16 +442,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// disabled (no-op)
 			return m, nil
 		case "tab":
-			m.activeTab = (m.activeTab + 1) % 4
+			m.activeTab = (m.activeTab + 1) % tabCount
 			return m, nil
 		case "shift+tab":
-			m.activeTab = (m.activeTab + 3) % 4
+			m.activeTab = (m.activeTab + tabCount - 1) % tabCount
 			return m, nil
 		case "right":
-			m.activeTab = (m.activeTab + 1) % 4
+			m.activeTab = (m.activeTab + 1) % tabCount
 			return m, nil
 		case "left":
-			m.activeTab = (m.activeTab + 3) % 4
+			m.activeTab = (m.activeTab + tabCount - 1) % tabCount
 			return m, nil
 
 		case "/":
@@ -398,6 +465,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsSearching = true
 				m.procsSearch.Focus()
 				m.procsSearch.SetValue(m.procsQuery)
+				return m, nil
+			}
+			if m.activeTab == tabConns {
+				m.connsSearching = true
+				m.connsSearch.Focus()
+				m.connsSearch.SetValue(m.connsQuery)
 				return m, nil
 			}
 
@@ -416,9 +489,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.procsVP.SetContent(m.procsText)
 				return m, nil
 			}
+			if m.activeTab == tabConns && !m.connsSearching {
+				m.connsQuery = ""
+				m.connsSearch.SetValue("")
+				m.connsText = m.renderConnsText()
+				m.connsVP.SetContent(m.connsText)
+				return m, nil
+			}
 
 		case "ctrl+e":
 			return m, fetchExternalIPCmd()
+
+		case "r":
+			if m.activeTab == tabConns && !m.connsSearching {
+				m.connsRevDNS = !m.connsRevDNS
+				var cmds []tea.Cmd
+				if m.connsRevDNS {
+					cmds = m.kickConnLookups()
+				}
+				m.connsText = m.renderConnsText()
+				m.connsText = hardClipLinesToWidth(m.connsText, m.connsVP.Width)
+				m.connsVP.SetContent(m.connsText)
+				if len(cmds) > 0 {
+					return m, tea.Batch(cmds...)
+				}
+				return m, nil
+			}
+
+		case "g":
+			if m.activeTab == tabConns && !m.connsSearching {
+				m.connsGroup = !m.connsGroup
+				m.connsText = m.renderConnsText()
+				m.connsText = hardClipLinesToWidth(m.connsText, m.connsVP.Width)
+				m.connsVP.SetContent(m.connsText)
+				return m, nil
+			}
 		}
 	}
 
@@ -522,6 +627,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Conns search mode
+	if m.activeTab == tabConns && m.connsSearching {
+		var cmd tea.Cmd
+		m.connsSearch, cmd = m.connsSearch.Update(msg)
+
+		if km, ok := msg.(tea.KeyMsg); ok {
+			switch km.String() {
+			case "enter":
+				m.connsQuery = strings.TrimSpace(m.connsSearch.Value())
+				m.connsSearching = false
+				m.connsSearch.Blur()
+				m.connsText = m.renderConnsText()
+				m.connsVP.SetContent(m.connsText)
+				return m, nil
+
+			case "esc":
+				m.connsSearching = false
+				m.connsSearch.Blur()
+				return m, nil
+
+			case "ctrl+u":
+				m.connsSearch.SetValue("")
+				return m, cmd
+			}
+		}
+		return m, cmd
+	}
+
+	// Conns tab: scroll via viewport
+	if m.activeTab == tabConns {
+		var cmd tea.Cmd
+		m.connsVP, cmd = m.connsVP.Update(msg)
+		return m, cmd
+	}
+
 	return m, nil
 }
 
@@ -538,9 +678,11 @@ func (m Model) View() string {
 		body = m.viewPorts()
 	case tabProcs:
 		body = m.viewProcs()
+	case tabConns:
+		body = m.viewConns()
 	}
 
-	footer := subtleStyle.Render("Keys: tab/shift+tab • ←/→ • / search • Ctrl+u clear • ctrl+e ext-ip")
+	footer := subtleStyle.Render("Keys: tab/shift+tab • ←/→ • / search • Ctrl+u clear • ctrl+e ext-ip • r dns • g group (conns)")
 	if m.err != nil {
 		footer = errStyle.Render("Error: " + m.err.Error())
 	}
@@ -557,9 +699,10 @@ func (m Model) renderHeader() string {
 		renderTab("2 Interfaces", m.activeTab == tabIfaces),
 		renderTab("3 Ports", m.activeTab == tabPorts),
 		renderTab("4 Processes", m.activeTab == tabProcs),
+		renderTab("5 Connections", m.activeTab == tabConns),
 	}
 
-	left := titleStyle.Render("ducknetview 🦆 0.0.4") + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
+	left := titleStyle.Render("ducknetview 🦆 0.0.5") + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
 
 	rem := m.w - lipgloss.Width(left)
 	if rem < 0 {
@@ -675,6 +818,99 @@ func (m Model) viewProcs() string {
 
 	content := searchLine + "\n\n" + m.procsVP.View()
 	return boxStyle.Width(procsW).Height(procsH).Render(content)
+}
+
+func (m Model) viewConns() string {
+	connsW := min(m.w-2, 160)
+	connsH := m.bodyHeight()
+
+	if m.connsText == "" {
+		m.connsText = m.renderConnsText()
+		m.connsVP.SetContent(m.connsText)
+	}
+
+	searchLine := subtleStyle.Render("Press / to search")
+	if m.connsQuery != "" {
+		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.connsQuery) + subtleStyle.Render("  (press / to change, ctrl+u to clear)")
+	}
+	if m.connsSearching {
+		searchLine = m.connsSearch.View()
+	}
+
+	content := searchLine + "\n\n" + m.connsVP.View()
+	return boxStyle.Width(connsW).Height(connsH).Render(content)
+}
+
+func (m Model) renderConnsText() string {
+	var b strings.Builder
+
+	w := m.connsVP.Width
+	if w <= 0 {
+		w = 140
+	}
+
+	colProto := 4
+	colState := 11
+	colPID := 7
+
+	// Remaining width split between LOCAL, REMOTE, PROCESS.
+	rest := w - (colProto + 2 + colState + 2 + colPID + 1)
+	if rest < 30 {
+		rest = 30
+	}
+	colLocal := max(16, min(28, rest/3))
+	colRemote := max(18, min(32, rest/3))
+	colProc := rest - colLocal - colRemote - 4
+	if colProc < 8 {
+		colProc = 8
+	}
+
+	b.WriteString("Active connections (non-listening)\n")
+	b.WriteString("Scroll: ↑↓ PgUp/PgDn Home/End\n\n")
+
+	h := fmt.Sprintf("%s  %s  %s  %s  %s %s\n",
+		padRight("PR", colProto),
+		padRight("LOCAL", colLocal),
+		padRight("REMOTE", colRemote),
+		padRight("STATE", colState),
+		padRight("PID", colPID),
+		"PROCESS",
+	)
+	b.WriteString(h)
+	b.WriteString(strings.Repeat("─", min(w, colProto+2+colLocal+2+colRemote+2+colState+2+colPID+1+colProc)) + "\n")
+
+	if len(m.conns) == 0 {
+		b.WriteString("No data (yet)…\n")
+		return b.String()
+	}
+
+	q := m.connsQuery
+
+	for _, c := range m.conns {
+		proc := c.Process
+		if proc == "" {
+			proc = "-"
+		}
+
+		if q != "" && !(containsFold(c.Local, q) || containsFold(c.Remote, q) || containsFold(proc, q) || containsFold(c.State, q) || containsFold(c.Proto, q)) {
+			continue
+		}
+
+		proto := padRight(trunc(c.Proto, colProto), colProto)
+		local := padRight(trunc(c.Local, colLocal), colLocal)
+		remote := padRight(trunc(c.Remote, colRemote), colRemote)
+		state := padRight(trunc(c.State, colState), colState)
+		pid := padRight(fmt.Sprintf("%d", c.PID), colPID)
+		procTr := trunc(proc, colProc)
+
+		local = highlightFold(local, q)
+		remote = highlightFold(remote, q)
+		procTr = highlightFold(procTr, q)
+
+		b.WriteString(fmt.Sprintf("%s  %s  %s  %s  %s %s\n", proto, local, remote, state, pid, procTr))
+	}
+
+	return b.String()
 }
 
 func (m Model) renderPortsText() string {

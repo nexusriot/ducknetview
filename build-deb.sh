@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.0.4
+version=0.0.5
 arch="${1:-amd64}"
 
 echo "building deb for ducknetview $version ($arch)"
