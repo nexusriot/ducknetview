@@ -15,6 +15,28 @@ const (
 	IfacePhysical
 )
 
+// Label returns a short human-readable name for the interface kind.
+func (k IfaceKind) Label() string {
+	switch k {
+	case IfaceLoopback:
+		return "loopback"
+	case IfaceDockerBridge:
+		return "docker"
+	case IfaceLinuxBridge:
+		return "bridge"
+	case IfaceVeth:
+		return "veth"
+	case IfaceTunTap:
+		return "tun/tap"
+	case IfaceVirt:
+		return "virtual"
+	case IfacePhysical:
+		return "physical"
+	default:
+		return "unknown"
+	}
+}
+
 func ClassifyIface(name string) IfaceKind {
 	switch {
 	case name == "lo" || strings.HasPrefix(name, "lo"):

@@ -34,6 +34,16 @@ type NetSampler struct {
 	lastAt time.Time
 }
 
+// rate returns (cur-prev)/dt in bytes/sec. It guards against counter resets
+// (cur < prev, e.g. after an interface bounce or driver reload) which would
+// otherwise wrap the unsigned subtraction into a huge spurious spike.
+func rate(cur, prev uint64, dt float64) float64 {
+	if cur < prev || dt <= 0 {
+		return 0
+	}
+	return float64(cur-prev) / dt
+}
+
 func NewNetSampler() *NetSampler {
 	return &NetSampler{
 		last:   map[string]gnet.IOCountersStat{},
@@ -92,8 +102,8 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 			ii.TxTotal = c.BytesSent
 
 			if prev, ok2 := s.last[nif.Name]; ok2 {
-				ii.RxBps = float64(c.BytesRecv-prev.BytesRecv) / dt
-				ii.TxBps = float64(c.BytesSent-prev.BytesSent) / dt
+				ii.RxBps = rate(c.BytesRecv, prev.BytesRecv, dt)
+				ii.TxBps = rate(c.BytesSent, prev.BytesSent, dt)
 			}
 		}
 		ii.Kind = ClassifyIface(nif.Name)

@@ -1,12 +1,13 @@
 #!/bin/env bash
 
-version=0.0.5
+version=0.0.7
 arch="${1:-amd64}"
 
 echo "building deb for ducknetview $version ($arch)"
 
 if ! type "dpkg-deb" > /dev/null; then
-  echo "please install required build tools first"
+  echo "please install required build tools first (dpkg-deb)"
+  exit 1
 fi
 
 case "$arch" in

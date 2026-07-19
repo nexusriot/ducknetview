@@ -1,9 +1,8 @@
 package probe
 
 import (
-	"sort"
+	"syscall"
 
-	gnet "github.com/shirou/gopsutil/v4/net"
 	"github.com/shirou/gopsutil/v4/process"
 )
 
@@ -12,51 +11,72 @@ type ProcNet struct {
 	Name        string
 	ConnCount   int
 	ListenCount int
+	User        string  // owning user (best-effort)
+	CPU         float64 // percent, averaged over the process lifetime
+	Mem         float32 // percent of physical memory (RSS)
 }
 
-func TopProcsByConnections(limit int) ([]ProcNet, error) {
-	conns, err := gnet.Connections("all")
+// ProcDetail holds the extra, comparatively expensive process attributes shown
+// in the row-detail overlay. Fetched on demand for a single PID rather than for
+// every process each refresh.
+type ProcDetail struct {
+	User    string
+	Cmdline string
+	Ppid    int32
+	CPU     float64
+	Mem     float32
+}
+
+// EnrichProc fills the best-effort user/CPU/mem fields of pn in place. Errors
+// for individual attributes are ignored (the field stays zero/empty).
+func EnrichProc(pn *ProcNet) {
+	p, err := process.NewProcess(pn.PID)
 	if err != nil {
-		return nil, err
+		return
 	}
-
-	m := map[int32]*ProcNet{}
-	for _, c := range conns {
-		if c.Pid <= 0 {
-			continue
-		}
-		pn := m[c.Pid]
-		if pn == nil {
-			pn = &ProcNet{PID: c.Pid}
-			m[c.Pid] = pn
-		}
-		pn.ConnCount++
-		if c.Status == "LISTEN" {
-			pn.ListenCount++
-		}
+	if u, e := p.Username(); e == nil {
+		pn.User = u
 	}
-
-	out := make([]ProcNet, 0, len(m))
-	for pid, pn := range m {
-		if pn.Name == "" {
-			if p, e := process.NewProcess(pid); e == nil {
-				if n, e2 := p.Name(); e2 == nil {
-					pn.Name = n
-				}
-			}
-		}
-		out = append(out, *pn)
+	if c, e := p.CPUPercent(); e == nil {
+		pn.CPU = c
 	}
-
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].ConnCount != out[j].ConnCount {
-			return out[i].ConnCount > out[j].ConnCount
-		}
-		return out[i].PID < out[j].PID
-	})
-
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+	if mp, e := p.MemoryPercent(); e == nil {
+		pn.Mem = mp
 	}
-	return out, nil
+}
+
+// ProcessDetail returns the extended attributes for a single PID.
+func ProcessDetail(pid int32) (ProcDetail, error) {
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return ProcDetail{}, err
+	}
+	d := ProcDetail{}
+	if u, e := p.Username(); e == nil {
+		d.User = u
+	}
+	if cl, e := p.Cmdline(); e == nil {
+		d.Cmdline = cl
+	}
+	if pp, e := p.Ppid(); e == nil {
+		d.Ppid = pp
+	}
+	if c, e := p.CPUPercent(); e == nil {
+		d.CPU = c
+	}
+	if mp, e := p.MemoryPercent(); e == nil {
+		d.Mem = mp
+	}
+	return d, nil
+}
+
+// SignalProcess sends sig to the given PID (best-effort, via gopsutil). It may
+// fail with a permission error when the target is owned by another user and the
+// tool is not running with sufficient privileges.
+func SignalProcess(pid int32, sig syscall.Signal) error {
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return err
+	}
+	return p.SendSignal(sig)
 }

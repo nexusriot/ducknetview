@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,6 +98,9 @@ func (m Model) buildConnGroups() []*connGroup {
 	groups := map[string]*connGroup{}
 	order := []string{}
 	for _, c := range m.conns {
+		if !m.passConnFilters(c) {
+			continue
+		}
 		ip := stripPort(c.Remote)
 		g, ok := groups[ip]
 		if !ok {
@@ -148,29 +152,7 @@ func formatStates(states map[string]int) string {
 	})
 	parts := make([]string, 0, len(xs))
 	for _, x := range xs {
-		parts = append(parts, x.k+":"+itoa(x.v))
+		parts = append(parts, x.k+":"+strconv.Itoa(x.v))
 	}
 	return strings.Join(parts, " ")
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }
