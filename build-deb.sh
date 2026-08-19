@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.0.7
+version="$(sed -n 's/.*Version = "\(.*\)".*/\1/p' internal/version/version.go)"
 arch="${1:-amd64}"
 
 echo "building deb for ducknetview $version ($arch)"

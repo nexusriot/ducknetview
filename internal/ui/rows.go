@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -33,6 +34,28 @@ func onOff(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+func dashIfEmpty(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// userOrDash renders a row's owner, which is empty when the process could not
+// be inspected (typically another user's process without privileges).
+func userOrDash(user string) string { return dashIfEmpty(user) }
+
+// anyContainer reports whether any displayed process is running inside a
+// container, deciding whether the CONTAINER column is worth its width.
+func (m Model) anyContainer() bool {
+	for _, p := range m.procs {
+		if p.Container != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func clampInt(v, lo, hi int) int {
@@ -114,10 +137,20 @@ func (m Model) passIPVerFilter(hostport string) bool {
 	return isV6 // IPv6
 }
 
-// passConnFilters combines the protocol, IP-version and state quick filters for
-// a connection row (used by both the flat and grouped connection views).
+// passUserFilter applies the "only my processes" quick filter. Rows whose owner
+// could not be determined are kept: hiding them would silently drop system
+// sockets the user may well own.
+func (m Model) passUserFilter(owner string) bool {
+	if !m.onlyMine || m.currentUser == "" {
+		return true
+	}
+	return owner == "" || owner == m.currentUser
+}
+
+// passConnFilters combines the protocol, IP-version, state and user quick
+// filters for a connection row (used by both the flat and grouped views).
 func (m Model) passConnFilters(c probe.Conn) bool {
-	if !m.passProtoFilter(c.Proto) || !m.passIPVerFilter(c.Remote) {
+	if !m.passProtoFilter(c.Proto) || !m.passIPVerFilter(c.Remote) || !m.passUserFilter(c.User) {
 		return false
 	}
 	if m.publicOnly && probe.IPScope(stripPort(c.Remote)) != "public" {
@@ -153,7 +186,7 @@ func (m Model) isWatchedIP(ip string) bool {
 // anyFilterActive reports whether a non-default quick filter is set (used to
 // decide whether to show the filter summary line).
 func (m Model) anyFilterActive() bool {
-	return m.connStateFilter != 0 || m.protoFilter != 0 || m.ipVerFilter != 0 || m.publicOnly
+	return m.connStateFilter != 0 || m.protoFilter != 0 || m.ipVerFilter != 0 || m.publicOnly || m.onlyMine
 }
 
 // filterLabel describes the active quick filters, e.g. "tcp · established".
@@ -180,6 +213,9 @@ func (m Model) filterLabel() string {
 	if m.publicOnly {
 		parts = append(parts, "public")
 	}
+	if m.onlyMine {
+		parts = append(parts, "mine")
+	}
 	if len(parts) == 0 {
 		return "none"
 	}
@@ -203,10 +239,10 @@ func isNoiseIface(ii probe.IfaceInfo) bool {
 // data with the active search query and quick filters applied, then sorted.
 // They are shared by the renderers, the row cursor and the copy/export paths.
 func (m Model) filteredPorts() []probe.ListenPort {
-	q := m.portsQuery
+	q := newMatcher(m.filterQuery(m.portsQuery))
 	out := make([]probe.ListenPort, 0, len(m.ports))
 	for _, p := range m.ports {
-		if !m.passProtoFilter(p.Proto) || !m.passIPVerFilter(p.Local) {
+		if !m.passProtoFilter(p.Proto) || !m.passIPVerFilter(p.Local) || !m.passUserFilter(p.User) {
 			continue
 		}
 		proc := p.Process
@@ -217,8 +253,7 @@ func (m Model) filteredPorts() []probe.ListenPort {
 		if local == ":" || local == "0.0.0.0:0" {
 			local = "-"
 		}
-		svc := probe.ServiceName(portOf(p.Local), p.Proto)
-		if q != "" && !(containsFold(local, q) || containsFold(proc, q) || containsFold(p.Proto, q) || containsFold(svc, q)) {
+		if !q.match(local, proc, p.Proto, probe.ServiceName(portOf(p.Local), p.Proto), p.User) {
 			continue
 		}
 		out = append(out, p)
@@ -228,14 +263,18 @@ func (m Model) filteredPorts() []probe.ListenPort {
 }
 
 func (m Model) filteredProcs() []probe.ProcNet {
-	q := m.procsQuery
+	q := newMatcher(m.filterQuery(m.procsQuery))
 	out := make([]probe.ProcNet, 0, len(m.procs))
 	for _, p := range m.procs {
+		if !m.passUserFilter(p.User) {
+			continue
+		}
 		name := p.Name
 		if name == "" {
 			name = "-"
 		}
-		if q != "" && !(containsFold(name, q) || containsFold(fmt.Sprintf("%d", p.PID), q)) {
+		// Container ids are searchable, which doubles as a per-container filter.
+		if !q.match(name, fmt.Sprintf("%d", p.PID), p.User, p.Container) {
 			continue
 		}
 		out = append(out, p)
@@ -245,7 +284,7 @@ func (m Model) filteredProcs() []probe.ProcNet {
 }
 
 func (m Model) filteredConns() []probe.Conn {
-	q := m.connsQuery
+	q := newMatcher(m.filterQuery(m.connsQuery))
 	out := make([]probe.Conn, 0, len(m.conns))
 	for _, c := range m.conns {
 		if !m.passConnFilters(c) {
@@ -255,9 +294,8 @@ func (m Model) filteredConns() []probe.Conn {
 		if proc == "" {
 			proc = "-"
 		}
-		remoteDisp := m.dnsDisplay(c.Remote)
-		svc := probe.ServiceName(portOf(c.Remote), c.Proto)
-		if q != "" && !(containsFold(c.Local, q) || containsFold(c.Remote, q) || containsFold(remoteDisp, q) || containsFold(proc, q) || containsFold(c.State, q) || containsFold(c.Proto, q) || containsFold(svc, q)) {
+		if !q.match(c.Local, c.Remote, m.dnsDisplay(c.Remote), proc, c.State, c.Proto,
+			probe.ServiceName(portOf(c.Remote), c.Proto), c.User) {
 			continue
 		}
 		out = append(out, c)
@@ -268,8 +306,8 @@ func (m Model) filteredConns() []probe.Conn {
 
 func (m Model) filteredGroups() []*connGroup {
 	groups := m.buildConnGroups()
-	q := m.connsQuery
-	if q == "" {
+	q := newMatcher(m.filterQuery(m.connsQuery))
+	if q.empty() {
 		m.sortGroups(groups)
 		return groups
 	}
@@ -281,9 +319,7 @@ func (m Model) filteredGroups() []*connGroup {
 				host = name
 			}
 		}
-		states := formatStates(g.states)
-		procs := strings.Join(g.procs, ",")
-		if containsFold(host, q) || containsFold(g.ip, q) || containsFold(states, q) || containsFold(procs, q) {
+		if q.match(host, g.ip, formatStates(g.states), strings.Join(g.procs, ",")) {
 			out = append(out, g)
 		}
 	}
@@ -292,10 +328,14 @@ func (m Model) filteredGroups() []*connGroup {
 }
 
 func (m Model) connsRowCount() int {
-	if m.connsGroup {
+	switch {
+	case m.showClosed:
+		return len(m.closedRows())
+	case m.connsGroup:
 		return len(m.filteredGroups())
+	default:
+		return len(m.filteredConns())
 	}
-	return len(m.filteredConns())
 }
 
 func (m Model) activeRowCount() int {
@@ -306,6 +346,10 @@ func (m Model) activeRowCount() int {
 		return len(m.filteredProcs())
 	case tabConns:
 		return m.connsRowCount()
+	case tabEvents:
+		// The filtered rows, not the whole buffer: the cursor must not be able
+		// to point past what is on screen.
+		return len(m.eventRows())
 	}
 	return 0
 }
@@ -320,6 +364,8 @@ func (m *Model) activeTableState() (*int, *viewport.Model) {
 		return &m.procsCursor, &m.procsVP
 	case tabConns:
 		return &m.connsCursor, &m.connsVP
+	case tabEvents:
+		return &m.eventsCursor, &m.eventsVP
 	}
 	return nil, nil
 }
@@ -352,6 +398,12 @@ func (m *Model) tableNav(msg tea.Msg) (bool, tea.Cmd) {
 
 	if mm, ok := msg.(tea.MouseMsg); ok {
 		if mm.Action == tea.MouseActionPress && mm.Button == tea.MouseButtonLeft {
+			// A click on the column header sorts by that column, the way a
+			// spreadsheet does; clicking the active column reverses it.
+			if key, ok := mouseHeaderKey(m.activeColumns(), vp.YOffset, mm.X, mm.Y); ok {
+				m.setSortColumn(key)
+				return true, nil
+			}
 			if i, ok := mouseRowIndex(vp, mm.Y); ok {
 				if count := m.activeRowCount(); count > 0 && i < count {
 					*cursor = i
@@ -410,6 +462,8 @@ func (m *Model) passToActiveVP(msg tea.Msg) (bool, tea.Cmd) {
 		m.procsVP, cmd = m.procsVP.Update(msg)
 	case tabConns:
 		m.connsVP, cmd = m.connsVP.Update(msg)
+	case tabEvents:
+		m.eventsVP, cmd = m.eventsVP.Update(msg)
 	default:
 		return false, nil
 	}
@@ -427,6 +481,9 @@ func (m *Model) rerenderActiveTable() {
 	case tabConns:
 		m.connsText = hardClipLinesToWidth(m.renderConnsText(), m.connsVP.Width)
 		m.connsVP.SetContent(m.connsText)
+	case tabEvents:
+		m.eventsText = hardClipLinesToWidth(m.renderEventsText(), m.eventsVP.Width)
+		m.eventsVP.SetContent(m.eventsText)
 	}
 }
 
@@ -454,6 +511,7 @@ func (m *Model) applyFilterChange() {
 	m.rerenderActiveTable()
 	m.scrollActiveTableTop()
 	m.status = "Filter: " + m.filterLabel()
+	m.saveConfig()
 }
 
 func ensureCursorVisible(vp *viewport.Model, cursor int) {
@@ -523,6 +581,17 @@ func (m Model) copyTarget() (text, what string, ok bool) {
 		return fmt.Sprintf("%d\t%s\tconns=%d\tlisten=%d", p.PID, name, p.ConnCount, p.ListenCount), "process row", true
 
 	case tabConns:
+		if m.showClosed {
+			rows := m.closedRows()
+			if m.connsCursor < 0 || m.connsCursor >= len(rows) {
+				return "", "", false
+			}
+			cc := rows[m.connsCursor]
+			return fmt.Sprintf("%s\t%s\t%s\tlife=%s\tclosed=%s\trx=%d\ttx=%d\t%d\t%s",
+				cc.conn.Proto, cc.conn.Local, m.dnsDisplay(cc.conn.Remote),
+				cc.lifetimeLabel(), cc.closedAt.Format(time.RFC3339),
+				cc.totals.rx, cc.totals.tx, cc.conn.PID, cc.conn.Process), "closed connection", true
+		}
 		if m.connsGroup {
 			rows := m.filteredGroups()
 			if m.connsCursor < 0 || m.connsCursor >= len(rows) {
@@ -547,6 +616,15 @@ func (m Model) copyTarget() (text, what string, ok bool) {
 			proc = "-"
 		}
 		return fmt.Sprintf("%s\t%s\t%s\t%s\t%d\t%s", c.Proto, c.Local, m.dnsDisplay(c.Remote), c.State, c.PID, proc), "connection row", true
+
+	case tabEvents:
+		rows := m.eventRows()
+		if m.eventsCursor < 0 || m.eventsCursor >= len(rows) {
+			return "", "", false
+		}
+		e := rows[m.eventsCursor]
+		return fmt.Sprintf("%s\t%s\t%s\t%s\t%s",
+			e.At.Format(time.RFC3339), e.Level, e.Kind, e.Subject, e.Detail), "event row", true
 	}
 	return "", "", false
 }

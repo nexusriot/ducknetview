@@ -30,35 +30,78 @@ func exportViewCmd(m Model) tea.Cmd {
 	switch m.activeTab {
 	case tabPorts:
 		name = "ports"
-		header = []string{"proto", "local", "service", "pid", "process"}
+		header = []string{"proto", "local", "service", "exposure", "in_baseline", "user", "pid", "process"}
 		for _, p := range m.filteredPorts() {
 			records = append(records, []string{
 				p.Proto, p.Local, probe.ServiceName(portOf(p.Local), p.Proto),
-				strconv.Itoa(int(p.PID)), p.Process,
+				probe.ListenerExposure(stripPort(p.Local)), strconv.FormatBool(!m.offBaseline(p)),
+				p.User, strconv.Itoa(int(p.PID)), p.Process,
 			})
 		}
 	case tabProcs:
 		name = "processes"
-		header = []string{"pid", "name", "user", "cpu_percent", "mem_percent", "conns", "listen"}
+		header = []string{"pid", "name", "user", "container", "cpu_percent", "mem_percent", "rx_bps", "tx_bps", "conns", "listen"}
 		for _, p := range m.filteredProcs() {
+			r := m.procRate(p.PID)
 			records = append(records, []string{
-				strconv.Itoa(int(p.PID)), p.Name, p.User,
+				strconv.Itoa(int(p.PID)), p.Name, p.User, p.Container,
 				strconv.FormatFloat(p.CPU, 'f', 1, 64),
 				strconv.FormatFloat(float64(p.Mem), 'f', 1, 32),
+				strconv.FormatFloat(r.rx, 'f', 0, 64), strconv.FormatFloat(r.tx, 'f', 0, 64),
 				strconv.Itoa(p.ConnCount), strconv.Itoa(p.ListenCount),
 			})
 		}
 	case tabConns:
+		if m.showClosed {
+			name = "closed_connections"
+			header = []string{"proto", "local", "remote", "service", "scope", "last_state",
+				"opened", "closed", "lifetime_seconds", "rx_bytes", "tx_bytes", "retrans", "user", "pid", "process"}
+			for _, cc := range m.closedRows() {
+				c := cc.conn
+				opened := ""
+				if !cc.firstSeen.IsZero() {
+					opened = cc.firstSeen.Format(time.RFC3339)
+				}
+				records = append(records, []string{
+					c.Proto, c.Local, m.dnsDisplay(c.Remote),
+					probe.ServiceName(portOf(c.Remote), c.Proto), probe.IPScope(stripPort(c.Remote)),
+					c.State, opened, cc.closedAt.Format(time.RFC3339),
+					strconv.FormatFloat(cc.lifetime().Seconds(), 'f', 1, 64),
+					strconv.FormatUint(cc.totals.rx, 10), strconv.FormatUint(cc.totals.tx, 10),
+					strconv.FormatUint(uint64(c.Retrans), 10), c.User,
+					strconv.Itoa(int(c.PID)), c.Process,
+				})
+			}
+			break
+		}
 		name = "connections"
-		header = []string{"proto", "local", "remote", "scope", "state", "first_seen", "pid", "process"}
+		header = []string{"proto", "local", "remote", "service", "scope", "state", "first_seen",
+			"rx_bps", "tx_bps", "rx_bytes", "tx_bytes", "rtt_ms", "user", "pid", "process"}
 		for _, c := range m.filteredConns() {
 			firstSeen := ""
 			if t, ok := m.connFirstSeen[connKey(c)]; ok && !t.IsZero() {
 				firstSeen = t.Format(time.RFC3339)
 			}
+			rtt := ""
+			if c.RTT > 0 {
+				rtt = strconv.FormatFloat(float64(c.RTT)/float64(time.Millisecond), 'f', 1, 64)
+			}
+			r := m.connRate(c)
 			records = append(records, []string{
-				c.Proto, c.Local, m.dnsDisplay(c.Remote), probe.IPScope(stripPort(c.Remote)),
-				c.State, firstSeen, strconv.Itoa(int(c.PID)), c.Process,
+				c.Proto, c.Local, m.dnsDisplay(c.Remote),
+				probe.ServiceName(portOf(c.Remote), c.Proto), probe.IPScope(stripPort(c.Remote)),
+				c.State, firstSeen,
+				strconv.FormatFloat(r.rx, 'f', 0, 64), strconv.FormatFloat(r.tx, 'f', 0, 64),
+				strconv.FormatUint(c.RxBytes, 10), strconv.FormatUint(c.TxBytes, 10), rtt,
+				c.User, strconv.Itoa(int(c.PID)), c.Process,
+			})
+		}
+	case tabEvents:
+		name = "events"
+		header = []string{"time", "level", "kind", "subject", "detail"}
+		for _, e := range m.eventRows() {
+			records = append(records, []string{
+				e.At.Format(time.RFC3339), e.Level.String(), e.Kind, e.Subject, e.Detail,
 			})
 		}
 	default:

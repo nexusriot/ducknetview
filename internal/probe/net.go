@@ -19,6 +19,24 @@ type IfaceInfo struct {
 	RxTotal  uint64
 	TxTotal  uint64
 	Kind     IfaceKind
+
+	// Packet rates and cumulative link-health counters. Non-zero errors or
+	// drops usually mean a bad cable, a saturated ring buffer or an overloaded
+	// driver, so they are worth showing next to the throughput.
+	RxPps     float64
+	TxPps     float64
+	RxPackets uint64
+	TxPackets uint64
+	Errin     uint64
+	Errout    uint64
+	Dropin    uint64
+	Dropout   uint64
+}
+
+// LinkProblems reports the total number of interface errors and drops seen
+// since boot. Zero on a healthy link.
+func (i IfaceInfo) LinkProblems() uint64 {
+	return i.Errin + i.Errout + i.Dropin + i.Dropout
 }
 
 type NetSnapshot struct {
@@ -34,10 +52,10 @@ type NetSampler struct {
 	lastAt time.Time
 }
 
-// rate returns (cur-prev)/dt in bytes/sec. It guards against counter resets
+// Rate returns (cur-prev)/dt in units per second. It guards against counter resets
 // (cur < prev, e.g. after an interface bounce or driver reload) which would
 // otherwise wrap the unsigned subtraction into a huge spurious spike.
-func rate(cur, prev uint64, dt float64) float64 {
+func Rate(cur, prev uint64, dt float64) float64 {
 	if cur < prev || dt <= 0 {
 		return 0
 	}
@@ -100,10 +118,16 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 		if c, ok := cur[nif.Name]; ok {
 			ii.RxTotal = c.BytesRecv
 			ii.TxTotal = c.BytesSent
+			ii.RxPackets = c.PacketsRecv
+			ii.TxPackets = c.PacketsSent
+			ii.Errin, ii.Errout = c.Errin, c.Errout
+			ii.Dropin, ii.Dropout = c.Dropin, c.Dropout
 
 			if prev, ok2 := s.last[nif.Name]; ok2 {
-				ii.RxBps = rate(c.BytesRecv, prev.BytesRecv, dt)
-				ii.TxBps = rate(c.BytesSent, prev.BytesSent, dt)
+				ii.RxBps = Rate(c.BytesRecv, prev.BytesRecv, dt)
+				ii.TxBps = Rate(c.BytesSent, prev.BytesSent, dt)
+				ii.RxPps = Rate(c.PacketsRecv, prev.PacketsRecv, dt)
+				ii.TxPps = Rate(c.PacketsSent, prev.PacketsSent, dt)
 			}
 		}
 		ii.Kind = ClassifyIface(nif.Name)

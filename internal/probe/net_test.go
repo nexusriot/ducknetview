@@ -17,8 +17,8 @@ func TestRate(t *testing.T) {
 		{"negative dt", 2000, 1000, -1, 0},
 	}
 	for _, c := range cases {
-		if got := rate(c.cur, c.prev, c.dt); got != c.want {
-			t.Fatalf("%s: rate(%d,%d,%v) = %v, want %v", c.name, c.cur, c.prev, c.dt, got, c.want)
+		if got := Rate(c.cur, c.prev, c.dt); got != c.want {
+			t.Fatalf("%s: Rate(%d,%d,%v) = %v, want %v", c.name, c.cur, c.prev, c.dt, got, c.want)
 		}
 	}
 }

@@ -10,11 +10,15 @@ import (
 // Sort columns offered per table tab, cycled with `s` (direction toggled with
 // `S`). The first entry of each is the default sort key.
 var (
-	portsSortCols = []string{"proto", "port", "pid", "process"}
-	procsSortCols = []string{"conns", "listen", "cpu", "mem", "pid", "name"}
-	connsSortCols = []string{"pid", "proto", "state", "local", "remote", "process", "scope", "age"}
-	groupSortCols = []string{"conns", "host"}
+	portsSortCols = []string{"proto", "port", "pid", "process", "user"}
+	procsSortCols = []string{"conns", "listen", "cpu", "mem", "rx", "tx", "pid", "name", "user"}
+	connsSortCols = []string{"pid", "proto", "state", "local", "remote", "process", "scope", "age", "rx", "tx", "rtt", "retrans"}
+	groupSortCols = []string{"conns", "host", "bytes"}
 )
+
+// rateSortCols are the sort keys backed by throughput, which lives in the
+// model's rate maps rather than on the probe rows (like "age").
+func isRateSortCol(col string) bool { return col == "rx" || col == "tx" }
 
 func cmpStr(a, b string) int {
 	a, b = strings.ToLower(a), strings.ToLower(b)
@@ -86,6 +90,10 @@ func cmpPorts(a, b probe.ListenPort, col string) int {
 		if c := cmpStr(a.Process, b.Process); c != 0 {
 			return c
 		}
+	case "user":
+		if c := cmpStr(a.User, b.User); c != 0 {
+			return c
+		}
 	}
 	if c := cmpStr(a.Local, b.Local); c != 0 {
 		return c
@@ -117,6 +125,10 @@ func cmpProcs(a, b probe.ProcNet, col string) int {
 		}
 	case "name":
 		if c := cmpStr(a.Name, b.Name); c != 0 {
+			return c
+		}
+	case "user":
+		if c := cmpStr(a.User, b.User); c != 0 {
 			return c
 		}
 	}
@@ -151,6 +163,15 @@ func cmpConns(a, b probe.Conn, col string) int {
 		}
 	case "scope":
 		if c := cmpInt(scopeRank(probe.IPScope(stripPort(a.Remote))), scopeRank(probe.IPScope(stripPort(b.Remote)))); c != 0 {
+			return c
+		}
+	case "rtt":
+		// Slowest first: a sort on latency is a hunt for the bad connection.
+		if c := -cmpInt(int(a.RTT), int(b.RTT)); c != 0 {
+			return c
+		}
+	case "retrans":
+		if c := -cmpInt(int(a.Retrans), int(b.Retrans)); c != 0 {
 			return c
 		}
 	}
@@ -208,6 +229,27 @@ func (m Model) sortPorts(rows []probe.ListenPort) {
 
 func (m Model) sortProcs(rows []probe.ProcNet) {
 	col := procsSortCols[m.procsSortCol]
+	if isRateSortCol(col) {
+		// Throughput lives in the model's rate and totals maps, not on the row,
+		// and follows whichever the RX/TX columns are showing. The tab defaults
+		// to descending, so this ordering puts the busiest first.
+		sort.SliceStable(rows, func(i, j int) bool {
+			var c int
+			if m.showTotals {
+				c = cmpTotals(m.procTotal(rows[i].PID), m.procTotal(rows[j].PID), col)
+			} else {
+				c = cmpRate(m.procRate(rows[i].PID), m.procRate(rows[j].PID), col)
+			}
+			if c == 0 {
+				c = cmpInt(int(rows[i].PID), int(rows[j].PID))
+			}
+			if m.procsSortDesc {
+				c = -c
+			}
+			return c < 0
+		})
+		return
+	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		c := cmpProcs(rows[i], rows[j], col)
 		if m.procsSortDesc {
@@ -217,8 +259,55 @@ func (m Model) sortProcs(rows []probe.ProcNet) {
 	})
 }
 
+// cmpRate orders two throughput samples on the given key, ascending.
+func cmpRate(a, b rateSample, col string) int {
+	if col == "tx" {
+		return cmpFloat(a.tx, b.tx)
+	}
+	return cmpFloat(a.rx, b.rx)
+}
+
+// cmpTotals orders two cumulative traffic totals on the given key, ascending.
+func cmpTotals(a, b byteTotals, col string) int {
+	if col == "tx" {
+		return cmpInt64(a.tx, b.tx)
+	}
+	return cmpInt64(a.rx, b.rx)
+}
+
+func cmpInt64(a, b uint64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func (m Model) sortConns(rows []probe.Conn) {
 	col := connsSortCols[m.connsSortCol]
+	if isRateSortCol(col) {
+		// This tab defaults to ascending, so negate to surface the busiest
+		// connections first — the same convention the "age" key uses.
+		sort.SliceStable(rows, func(i, j int) bool {
+			var c int
+			if m.showTotals {
+				c = -cmpTotals(m.connTotal(rows[i]), m.connTotal(rows[j]), col)
+			} else {
+				c = -cmpRate(m.connRate(rows[i]), m.connRate(rows[j]), col)
+			}
+			if c == 0 {
+				c = cmpConns(rows[i], rows[j], "pid")
+			}
+			if m.connsSortDesc {
+				c = -c
+			}
+			return c < 0
+		})
+		return
+	}
 	if col == "age" {
 		// Age lives in the model's first-seen map, not on the Conn, so sort it
 		// here: default (ascending) shows the newest connections first.
@@ -252,6 +341,27 @@ func (m Model) sortConns(rows []probe.Conn) {
 
 func (m Model) sortGroups(rows []*connGroup) {
 	col := groupSortCols[m.groupSortCol]
+	if col == "bytes" {
+		// Ranks remote hosts by traffic — the grouped view's answer to "who am
+		// I actually talking to the most".
+		sort.SliceStable(rows, func(i, j int) bool {
+			var c int
+			if m.showTotals {
+				c = cmpInt64(m.hostTotal(rows[i].ip).sum(), m.hostTotal(rows[j].ip).sum())
+			} else {
+				ri, rj := m.groupRate(rows[i]), m.groupRate(rows[j])
+				c = cmpFloat(ri.rx+ri.tx, rj.rx+rj.tx)
+			}
+			if c == 0 {
+				c = cmpStr(rows[i].ip, rows[j].ip)
+			}
+			if m.groupSortDesc {
+				c = -c
+			}
+			return c < 0
+		})
+		return
+	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		c := cmpGroups(rows[i], rows[j], col)
 		if m.groupSortDesc {
@@ -261,8 +371,66 @@ func (m Model) sortGroups(rows []*connGroup) {
 	})
 }
 
-// sortLabel describes the active table tab's current sort, e.g. "conns ↓".
-func (m Model) sortLabel() string {
+// sortKey returns the active tab's current sort column, and sortDesc its
+// direction. The column header marks that column with an arrow.
+func (m Model) sortKey() string {
+	col, _ := m.activeSort()
+	return col
+}
+
+func (m Model) sortDesc() bool {
+	_, desc := m.activeSort()
+	return desc
+}
+
+// setSortColumn sorts the active tab by a column key, or reverses the direction
+// when that column is already the active one — what clicking a header twice is
+// expected to do.
+func (m *Model) setSortColumn(key string) bool {
+	var (
+		cols []string
+		idx  *int
+		desc *bool
+	)
+	switch m.activeTab {
+	case tabPorts:
+		cols, idx, desc = portsSortCols, &m.portsSortCol, &m.portsSortDesc
+	case tabProcs:
+		cols, idx, desc = procsSortCols, &m.procsSortCol, &m.procsSortDesc
+	case tabConns:
+		switch {
+		case m.showClosed:
+			cols, idx, desc = closedSortCols, &m.closedSortCol, &m.closedSortDesc
+		case m.connsGroup:
+			cols, idx, desc = groupSortCols, &m.groupSortCol, &m.groupSortDesc
+		default:
+			cols, idx, desc = connsSortCols, &m.connsSortCol, &m.connsSortDesc
+		}
+	default:
+		return false
+	}
+
+	for i, c := range cols {
+		if c != key {
+			continue
+		}
+		if *idx == i {
+			*desc = !*desc
+		} else {
+			*idx = i
+		}
+		m.resetTableCursor()
+		m.rerenderActiveTable()
+		m.scrollActiveTableTop()
+		m.status = "Sort: " + m.sortLabel()
+		m.saveConfig()
+		return true
+	}
+	return false
+}
+
+// activeSort returns the current sort column and direction for the active tab.
+func (m Model) activeSort() (string, bool) {
 	var col string
 	var desc bool
 	switch m.activeTab {
@@ -271,12 +439,24 @@ func (m Model) sortLabel() string {
 	case tabProcs:
 		col, desc = procsSortCols[m.procsSortCol], m.procsSortDesc
 	case tabConns:
-		if m.connsGroup {
+		switch {
+		case m.showClosed:
+			col, desc = closedSortCols[m.closedSortCol], m.closedSortDesc
+		case m.connsGroup:
 			col, desc = groupSortCols[m.groupSortCol], m.groupSortDesc
-		} else {
+		default:
 			col, desc = connsSortCols[m.connsSortCol], m.connsSortDesc
 		}
 	default:
+		return "", false
+	}
+	return col, desc
+}
+
+// sortLabel describes the active table tab's current sort, e.g. "conns ↓".
+func (m Model) sortLabel() string {
+	col, desc := m.activeSort()
+	if col == "" {
 		return ""
 	}
 	if desc {
@@ -296,9 +476,12 @@ func (m *Model) cycleSortColumn() {
 		m.procsSortCol = (m.procsSortCol + 1) % len(procsSortCols)
 		m.procsCursor = 0
 	case tabConns:
-		if m.connsGroup {
+		switch {
+		case m.showClosed:
+			m.closedSortCol = (m.closedSortCol + 1) % len(closedSortCols)
+		case m.connsGroup:
 			m.groupSortCol = (m.groupSortCol + 1) % len(groupSortCols)
-		} else {
+		default:
 			m.connsSortCol = (m.connsSortCol + 1) % len(connsSortCols)
 		}
 		m.connsCursor = 0
@@ -321,9 +504,12 @@ func (m *Model) toggleSortDir() {
 		m.procsSortDesc = !m.procsSortDesc
 		m.procsCursor = 0
 	case tabConns:
-		if m.connsGroup {
+		switch {
+		case m.showClosed:
+			m.closedSortDesc = !m.closedSortDesc
+		case m.connsGroup:
 			m.groupSortDesc = !m.groupSortDesc
-		} else {
+		default:
 			m.connsSortDesc = !m.connsSortDesc
 		}
 		m.connsCursor = 0

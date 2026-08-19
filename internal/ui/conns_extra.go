@@ -9,6 +9,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/nexusriot/ducknetview/internal/probe"
 )
 
 // dnsMsg is the result of a single reverse-DNS lookup.
@@ -92,6 +94,19 @@ type connGroup struct {
 	states    map[string]int
 	procs     []string
 	seenProcs map[string]bool
+	conns     []probe.Conn
+}
+
+// groupRate sums the current throughput of every connection to a remote host,
+// so the grouped view ranks hosts the same way the flat view ranks sockets.
+func (m Model) groupRate(g *connGroup) rateSample {
+	var out rateSample
+	for _, c := range g.conns {
+		r := m.connRate(c)
+		out.rx += r.rx
+		out.tx += r.tx
+	}
+	return out
 }
 
 func (m Model) buildConnGroups() []*connGroup {
@@ -109,6 +124,7 @@ func (m Model) buildConnGroups() []*connGroup {
 			order = append(order, ip)
 		}
 		g.count++
+		g.conns = append(g.conns, c)
 		if c.State != "" {
 			g.states[c.State]++
 		}

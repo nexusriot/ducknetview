@@ -1,6 +1,6 @@
 BINARY  := ducknetview
 PKG     := ./cmd/ducknetview
-VERSION := 0.0.7
+VERSION := $(shell sed -n 's/.*Version = "\(.*\)".*/\1/p' internal/version/version.go)
 PREFIX  ?= /usr/local
 
 GO      ?= go

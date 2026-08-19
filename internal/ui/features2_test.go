@@ -162,10 +162,18 @@ func TestDetailOverlay(t *testing.T) {
 		t.Fatalf("detail should include service %q: %q", svc, m.detailText)
 	}
 
+	// Navigation keys scroll the overlay instead of dismissing it, so long
+	// command lines can be read in full.
 	model, _ = m.Update(key("j"))
 	m = model.(Model)
+	if !m.showDetail {
+		t.Fatal("j should scroll the detail overlay, not close it")
+	}
+
+	model, _ = m.Update(key("z"))
+	m = model.(Model)
 	if m.showDetail {
-		t.Fatal("any key should close the detail overlay")
+		t.Fatal("any non-navigation key should close the detail overlay")
 	}
 }
 

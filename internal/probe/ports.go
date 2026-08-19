@@ -1,6 +1,10 @@
 package probe
 
 import (
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 
 	gnet "github.com/shirou/gopsutil/v4/net"
@@ -11,6 +15,7 @@ type ListenPort struct {
 	Local   string // ip:port
 	PID     int32
 	Process string
+	User    string
 }
 
 func connProto(c gnet.ConnectionStat) string {
@@ -22,6 +27,30 @@ func connProto(c gnet.ConnectionStat) string {
 	default:
 		return "net"
 	}
+}
+
+var (
+	ephemeralOnce sync.Once
+	ephemeralLow  = 32768 // conservative default if the sysctl is unreadable
+)
+
+// IsEphemeralPort reports whether a port falls in the kernel's local port
+// range — the pool client sockets are assigned from. It matters because UDP has
+// no LISTEN state, so an outbound DNS query is indistinguishable from a UDP
+// service by socket state alone; the port range is the only signal available.
+func IsEphemeralPort(port int) bool {
+	ephemeralOnce.Do(func() {
+		b, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+		if err != nil {
+			return
+		}
+		if fields := strings.Fields(string(b)); len(fields) >= 1 {
+			if low, err := strconv.Atoi(fields[0]); err == nil && low > 0 {
+				ephemeralLow = low
+			}
+		}
+	})
+	return port >= ephemeralLow
 }
 
 func isListening(c gnet.ConnectionStat) bool {

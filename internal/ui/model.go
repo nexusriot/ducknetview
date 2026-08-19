@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/user"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +20,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/nexusriot/ducknetview/internal/probe"
+	"github.com/nexusriot/ducknetview/internal/version"
 )
 
 type tab int
@@ -27,9 +31,10 @@ const (
 	tabPorts
 	tabProcs
 	tabConns
+	tabEvents
 	headerH  = 1
 	footerH  = 1
-	tabCount = 5
+	tabCount = 6
 )
 
 type tickMsg time.Time
@@ -101,6 +106,15 @@ type Model struct {
 	connsSearching bool
 	connsQuery     string
 
+	eventsSearch     textinput.Model
+	eventsSearching  bool
+	eventsQuery      string
+	eventLevelFilter int // 0 all · 1 warn and above · 2 alerts only
+
+	// Whether a query hides non-matching rows or merely marks them (see
+	// search.go). Highlight mode is what n/N navigate.
+	searchMode searchMode
+
 	// Row cursors (index into the filtered/displayed rows of each table tab)
 	portsCursor int
 	procsCursor int
@@ -129,8 +143,17 @@ type Model struct {
 	// Conns extras
 	connsRevDNS bool
 	connsGroup  bool
-	dnsCache    map[string]string // ip -> hostname (empty string means resolved but no PTR)
-	dnsTried    map[string]bool   // ip -> already attempted (don't retry within session)
+
+	// Retained history of connections that have gone away (see closed.go),
+	// shown in place of the active list when showClosed is on.
+	showClosed     bool
+	closedConns    []closedConn
+	prevConns      map[string]probe.Conn
+	closedSortCol  int
+	closedSortDesc bool
+
+	dnsCache map[string]string // ip -> hostname (empty string means resolved but no PTR)
+	dnsTried map[string]bool   // ip -> already attempted (don't retry within session)
 
 	externalIP          string
 	externalIPErr       error
@@ -141,9 +164,11 @@ type Model struct {
 	paused          bool
 	lastConnFetch   time.Time
 
-	// Row-detail overlay (toggled with `enter` on a table tab).
+	// Row-detail overlay (toggled with `enter` on a row-cursor tab). It lives
+	// in its own viewport so long command lines can wrap and scroll.
 	showDetail bool
 	detailText string
+	detailVP   viewport.Model
 
 	// Kill-process confirmation (armed with `x`, resolved with a signal key).
 	confirmingKill bool
@@ -152,6 +177,11 @@ type Model struct {
 
 	// Aggregate bandwidth history across interfaces (Overview total sparkline).
 	totalRxHist, totalTxHist []float64
+
+	// Peaks for the whole session. The history slices are clamped to the chart
+	// width, so their maximum is only the peak of what is still on screen.
+	totalPeak  rateSample
+	ifacePeaks map[string]rateSample
 
 	// Connection tracking across enumerations: first-seen time per connection
 	// key drives both the AGE column and the new/closed delta counters.
@@ -162,20 +192,75 @@ type Model struct {
 	connRemoved   int
 
 	// Listening-port tracking across enumerations: newly-appeared listeners are
-	// highlighted (a new listener can mean a backdoor or a regression).
-	prevPortKeys map[string]bool
-	newPorts     map[string]bool
-	portSeen     bool
+	// highlighted (a new listener can mean a backdoor or a regression). The
+	// previous set keeps whole rows so a listener that goes away can still be
+	// described in the event log.
+	prevPorts map[string]probe.ListenPort
+	newPorts  map[string]bool
+	portSeen  bool
+
+	// Event log (see events.go): a ring buffer of things that changed, plus the
+	// bookkeeping needed to detect those changes.
+	events       []event
+	eventsVP     viewport.Model
+	eventsText   string
+	eventsCursor int
+	eventLog     *os.File
+	eventLogPath string
+	eventLogErr  error
+	dstSeen      map[string]bool // public remotes already reported this session
+	prevIfaceUp  map[string]bool
+
+	// Throughput alert thresholds in bytes/sec (0 disables), the per-subject
+	// re-fire suppression, and the optional external hook (see alerts.go).
+	alertProcBps float64
+	alertConnBps float64
+	alertFired   map[string]time.Time
+	alertHook    string
+	pendingHooks []event
 
 	// Connections/ports quick filters (session-only, not persisted).
 	connStateFilter int  // 0 all · 1 established · 2 active (exclude teardown)
 	protoFilter     int  // 0 all · 1 tcp · 2 udp
 	ipVerFilter     int  // 0 all · 1 IPv4 · 2 IPv6
 	publicOnly      bool // show only connections to public (routable) remotes
+	onlyMine        bool // show only rows owned by the current user
+
+	// Username this process runs as, resolved once; "" when unavailable, which
+	// disables the onlyMine filter.
+	currentUser string
+
+	// Per-socket throughput derived from consecutive enumerations of the
+	// kernel's cumulative byte counters (see rates.go). hasThroughput latches
+	// once the platform proves it can account for sockets, so the RX/TX columns
+	// are hidden entirely where they would only ever read "-".
+	hasThroughput  bool
+	prevSockBytes  map[string]sockBytes
+	connRates      map[string]rateSample
+	procRates      map[int32]rateSample
+	lastRateSample time.Time
+
+	// Rolling per-row throughput history, for the detail-overlay sparklines.
+	connRateHist map[string]*rateHistory
+	procRateHist map[int32]*rateHistory
+
+	// Cumulative session traffic (see totals.go). showTotals swaps the RX/TX
+	// columns — and what the rx/tx sort keys order by — from current rate to
+	// bytes moved this session.
+	showTotals   bool
+	sessionTotal byteTotals
+	procTotals   map[int32]*talker
+	hostTotals   map[string]*talker
 
 	// Watchlist of remote addresses to highlight (loaded from config).
 	watch        *watchList
 	watchlistRaw []string
+
+	// Expected listener set (see baseline.go), persisted so that "unexpected
+	// listener" survives a restart.
+	baseline    map[string]bool
+	baselineRaw []string
+	baselineAt  time.Time
 }
 
 // refreshSteps are the selectable auto-refresh intervals, cycled with `+`/`-`.
@@ -187,10 +272,19 @@ var refreshSteps = []time.Duration{
 	10 * time.Second,
 }
 
-// connFetchInterval is the minimum spacing between socket enumerations; the
-// ports/procs/conns views refresh no faster than this regardless of the chosen
-// interface-sample interval, since enumeration is comparatively expensive.
-const connFetchInterval = 5 * time.Second
+// connFetchFloor is the fastest the ports/procs/conns views are ever
+// re-enumerated. Enumerating every socket costs roughly twenty times an
+// interface sample, so the socket views follow the chosen refresh rate but
+// never run faster than this.
+const connFetchFloor = 2 * time.Second
+
+// socketInterval is how often the socket-derived views are refreshed.
+func (m Model) socketInterval() time.Duration {
+	if m.refreshInterval > connFetchFloor {
+		return m.refreshInterval
+	}
+	return connFetchFloor
+}
 
 func NewModel() Model {
 	ls := list.New([]list.Item{}, list.NewDefaultDelegate(), 30, 10)
@@ -202,6 +296,7 @@ func NewModel() Model {
 	kvp := viewport.New(0, 0)
 	dvp := viewport.New(0, 0)
 	cvp := viewport.New(0, 0)
+	evp := viewport.New(0, 0)
 
 	ps := textinput.New()
 	ps.Placeholder = "search port / address / process"
@@ -218,6 +313,11 @@ func NewModel() Model {
 	cs.Prompt = "/ "
 	cs.CharLimit = 64
 
+	es := textinput.New()
+	es.Placeholder = "search kind / subject / detail"
+	es.Prompt = "/ "
+	es.CharLimit = 64
+
 	m := Model{
 		activeTab:  tabOverview,
 		netSampler: probe.NewNetSampler(),
@@ -227,10 +327,12 @@ func NewModel() Model {
 		portsVP:        pvp,
 		procsVP:        kvp,
 		connsVP:        cvp,
+		eventsVP:       evp,
 		ifaceDetailsVP: dvp,
 		portsSearch:    ps,
 		procsSearch:    qs,
 		connsSearch:    cs,
+		eventsSearch:   es,
 
 		// Default to the previous fixed orderings: procs & grouped conns by
 		// connection count descending; ports & conns ascending by their first
@@ -240,8 +342,19 @@ func NewModel() Model {
 
 		refreshInterval: refreshSteps[0],
 		lastConnFetch:   time.Now(),
+		currentUser:     currentUsername(),
 	}
 	return m
+}
+
+// currentUsername resolves the user this process runs as, for the "only my
+// processes" filter. An error just leaves the filter inert.
+func currentUsername() string {
+	u, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return u.Username
 }
 
 // WithConfig overlays persisted settings (sort keys, toggles, refresh rate)
@@ -295,6 +408,9 @@ func (m Model) Init() tea.Cmd {
 // config is always written on a clean exit.
 func (m Model) quit() (tea.Model, tea.Cmd) {
 	m.saveConfig()
+	if m.eventLog != nil {
+		_ = m.eventLog.Close()
+	}
 	return m, tea.Quit
 }
 
@@ -439,6 +555,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.connsVP.Width = max(10, connsW-2)
 		m.connsVP.Height = max(5, bodyH-4)
 
+		// Events
+		eventsW := min(m.w-2, 140)
+		m.eventsVP.Width = max(10, eventsW-2)
+		m.eventsVP.Height = max(5, bodyH-4)
+
+		// Row-detail overlay
+		if m.showDetail {
+			m.setDetail(m.detailText)
+		}
+
 		// Interfaces right
 		rightW := m.w - leftW - 3
 		m.ifaceDetailsVP.Width = max(10, rightW-2)
@@ -475,7 +601,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds := []tea.Cmd{tickEvery(m.refreshInterval)}
 		if !m.paused {
 			cmds = append(cmds, m.refreshCmd())
-			if now := time.Now(); now.Sub(m.lastConnFetch) >= connFetchInterval {
+			if now := time.Now(); now.Sub(m.lastConnFetch) >= m.socketInterval() {
 				m.lastConnFetch = now
 				cmds = append(cmds, fetchConnInfoCmd())
 			}
@@ -489,6 +615,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastSnap = probe.NetSnapshot(msg)
 		m.err = nil
 
+		m.noteIfaceEvents(m.lastSnap)
 		m.rebuildIfaceList()
 
 		histMax := max(30, min(200, m.w/2))
@@ -504,7 +631,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Aggregate bandwidth across real interfaces (loopback excluded) for the
 		// Overview total sparkline.
 		var totRx, totTx float64
+		if m.ifacePeaks == nil {
+			m.ifacePeaks = map[string]rateSample{}
+		}
 		for _, ii := range m.lastSnap.Ifaces {
+			peak := m.ifacePeaks[ii.Name]
+			peak.rx = max64(peak.rx, ii.RxBps)
+			peak.tx = max64(peak.tx, ii.TxBps)
+			m.ifacePeaks[ii.Name] = peak
+
 			if ii.Kind == probe.IfaceLoopback {
 				continue
 			}
@@ -513,6 +648,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.totalRxHist = probe.ClampHistory(append(m.totalRxHist, totRx), histMax)
 		m.totalTxHist = probe.ClampHistory(append(m.totalTxHist, totTx), histMax)
+		m.totalPeak.rx = max64(m.totalPeak.rx, totRx)
+		m.totalPeak.tx = max64(m.totalPeak.tx, totTx)
 
 		m.ifaceDetailsText = m.renderIfaceDetailsText(m.ifaceDetailsVP.Width)
 		m.ifaceDetailsText = hardClipLinesToWidth(
@@ -528,10 +665,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.procs = msg.Procs
 		m.conns = msg.Conns
 
+		now := time.Now()
+		// Ordering matters: closures are detected from the previous poll's rows
+		// and counters, which updateRates is about to overwrite.
+		m.noteClosedConns(msg.Conns, now)
+		m.updateRates(msg.Conns, now)
+
 		// Track each connection's first-seen time across enumerations: this
 		// drives the AGE column and the new/closed delta counters. The first
 		// enumeration establishes a baseline (nothing is "new" on startup).
-		now := time.Now()
 		next := make(map[string]time.Time, len(msg.Conns))
 		curKeys := make(map[string]bool, len(msg.Conns))
 		m.newConns = map[string]bool{}
@@ -559,21 +701,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.connFirstSeen = next
 		m.connSeen = true
 
+		curConns := make(map[string]probe.Conn, len(msg.Conns))
+		for _, c := range msg.Conns {
+			curConns[connKey(c)] = c
+		}
+		m.prevConns = curConns
+
 		// Flag listeners that appeared since the previous enumeration.
-		curPortKeys := make(map[string]bool, len(msg.Ports))
+		curPorts := make(map[string]probe.ListenPort, len(msg.Ports))
 		for _, p := range msg.Ports {
-			curPortKeys[portKey(p)] = true
+			curPorts[portKey(p)] = p
 		}
 		m.newPorts = map[string]bool{}
 		if m.portSeen {
-			for k := range curPortKeys {
-				if !m.prevPortKeys[k] {
+			for k := range curPorts {
+				if _, known := m.prevPorts[k]; !known {
 					m.newPorts[k] = true
 				}
 			}
 		}
-		m.prevPortKeys = curPortKeys
+		prevPorts, firstRun := m.prevPorts, !m.portSeen
+		m.prevPorts = curPorts
 		m.portSeen = true
+
+		m.noteSocketEvents(prevPorts, msg.Conns, firstRun, now)
+		m.noteThroughputAlerts(msg.Conns, now)
 
 		m.portsCursor = clampInt(m.portsCursor, 0, len(m.filteredPorts())-1)
 		m.procsCursor = clampInt(m.procsCursor, 0, len(m.filteredProcs())-1)
@@ -587,6 +739,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.procsVP.SetContent(m.procsText)
 		m.connsText = hardClipLinesToWidth(m.renderConnsText(), m.connsVP.Width)
 		m.connsVP.SetContent(m.connsText)
+		m.eventsText = hardClipLinesToWidth(m.renderEventsText(), m.eventsVP.Width)
+		m.eventsVP.SetContent(m.eventsText)
+		m.refreshDetail()
+		cmds = append(cmds, m.drainAlertHooks()...)
 
 		if len(cmds) > 0 {
 			return m, tea.Batch(cmds...)
@@ -627,6 +783,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case alertHookResultMsg:
+		if msg.err != nil {
+			m.status = "Alert hook failed: " + msg.err.Error()
+		}
+		return m, nil
+
 	case exportResultMsg:
 		if msg.err != nil {
 			m.status = "Export failed: " + msg.err.Error()
@@ -652,10 +814,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Likewise for the row-detail overlay.
+		// The row-detail overlay scrolls and can be copied; any other key closes
+		// it (the same dismiss-on-keypress behaviour as the help overlay).
 		if m.showDetail {
-			if msg.String() == "ctrl+c" {
+			switch msg.String() {
+			case "ctrl+c":
 				return m.quit()
+			case "up", "down", "k", "j", "pgup", "pgdown", "home", "end":
+				var cmd tea.Cmd
+				m.detailVP, cmd = m.detailVP.Update(msg)
+				return m, cmd
+			case "y":
+				return m, copyToClipboardCmd(stripANSI(m.detailText), "row details")
 			}
 			m.showDetail = false
 			return m, nil
@@ -713,7 +883,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeTab = (m.activeTab + tabCount - 1) % tabCount
 			return m, nil
 
-		case "1", "2", "3", "4", "5":
+		case "1", "2", "3", "4", "5", "6":
 			// Jump straight to a tab via its number (matches the "1 Overview" …
 			// labels in the header). While a search box is focused let the digit
 			// fall through to the text input instead of switching tabs.
@@ -742,6 +912,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.connsSearching = true
 				m.connsSearch.Focus()
 				m.connsSearch.SetValue(m.connsQuery)
+				return m, nil
+			}
+			if m.activeTab == tabEvents {
+				m.eventsSearching = true
+				m.eventsSearch.Focus()
+				m.eventsSearch.SetValue(m.eventsQuery)
 				return m, nil
 			}
 
@@ -773,12 +949,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.connsVP.SetYOffset(0)
 				return m, nil
 			}
+			if m.activeTab == tabEvents && !m.eventsSearching {
+				m.eventsQuery = ""
+				m.eventsSearch.SetValue("")
+				m.eventsCursor = 0
+				m.rerenderActiveTable()
+				m.scrollActiveTableTop()
+				return m, nil
+			}
 
 		case "ctrl+e":
 			if m.anySearching() {
 				break // let the input handle ctrl+e (jump to line end)
 			}
 			return m, fetchExternalIPCmd()
+
+		case "R":
+			// Refresh everything now, without waiting for the next tick.
+			if !m.anySearching() {
+				m.lastConnFetch = time.Now()
+				m.status = "Refreshing…"
+				return m, tea.Batch(m.refreshCmd(), fetchConnInfoCmd())
+			}
 
 		case "r":
 			if m.activeTab == tabConns && !m.connsSearching {
@@ -799,8 +991,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "z":
+			// Switch the Connections tab between the live list and the history
+			// of connections that have closed.
+			if m.activeTab == tabConns && !m.connsSearching {
+				m.showClosed = !m.showClosed
+				m.connsCursor = 0
+				m.rerenderActiveTable()
+				m.scrollActiveTableTop()
+				if m.showClosed {
+					m.status = fmt.Sprintf("Closed connections (%d retained)", len(m.closedConns))
+				} else {
+					m.status = "Active connections"
+				}
+				return m, nil
+			}
+
 		case "g":
 			if m.activeTab == tabConns && !m.connsSearching {
+				if m.showClosed {
+					m.status = "Grouping applies to active connections (z to go back)"
+					return m, nil
+				}
 				m.connsGroup = !m.connsGroup
 				m.connsCursor = 0
 				m.connsText = m.renderConnsText()
@@ -873,9 +1085,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter":
 			// Show full, un-truncated details for the highlighted row.
-			if !m.anySearching() && m.isTableTab() {
+			if !m.anySearching() && m.hasRowCursor() {
 				if txt, ok := m.detailContent(); ok {
-					m.detailText = txt
+					m.setDetail(txt)
 					m.showDetail = true
 				}
 				return m, nil
@@ -910,6 +1122,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "u":
+			// Toggle "only my processes" (Ports / Processes / Connections).
+			if !m.anySearching() && m.isTableTab() {
+				if m.currentUser == "" {
+					m.status = "Cannot determine the current user"
+					return m, nil
+				}
+				m.onlyMine = !m.onlyMine
+				m.applyFilterChange()
+				return m, nil
+			}
+
 		case "p":
 			// Cycle the protocol filter (Ports / Connections tabs).
 			if !m.anySearching() && (m.activeTab == tabPorts || m.activeTab == tabConns) {
@@ -928,8 +1152,101 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "e":
 			// Export the current (filtered/sorted) table view to a CSV file.
-			if !m.anySearching() && m.isTableTab() {
+			if !m.anySearching() && m.hasRowCursor() {
 				return m, exportViewCmd(m)
+			}
+
+		case "\\":
+			// Switch between hiding non-matching rows and marking them in place.
+			if !m.anySearching() && m.hasRowCursor() {
+				if m.searchMode == searchFilter {
+					m.searchMode = searchHighlight
+				} else {
+					m.searchMode = searchFilter
+				}
+				m.resetTableCursor()
+				m.rerenderActiveTable()
+				m.scrollActiveTableTop()
+				m.status = "Search mode: " + m.searchMode.String()
+				m.saveConfig()
+				return m, nil
+			}
+
+		case "n", "N":
+			// Walk the cursor between matching rows, which is what makes
+			// highlight mode navigable.
+			if !m.anySearching() && m.hasRowCursor() {
+				if m.activeQuery() == "" {
+					m.status = "No search query"
+					return m, nil
+				}
+				if !m.jumpToMatch(msg.String() == "n") {
+					m.status = "No matches"
+				}
+				return m, nil
+			}
+
+		case "t":
+			// Swap the throughput columns between current rate and session total.
+			if !m.anySearching() {
+				m.showTotals = !m.showTotals
+				m.rerenderActiveTable()
+				if m.showTotals {
+					m.status = "Showing session totals"
+				} else {
+					m.status = "Showing current rates"
+				}
+				m.saveConfig()
+				return m, nil
+			}
+
+		case "l":
+			// Cycle the event level filter (Events tab only).
+			if !m.anySearching() && m.activeTab == tabEvents {
+				m.eventLevelFilter = (m.eventLevelFilter + 1) % 3
+				m.eventsCursor = 0
+				m.rerenderActiveTable()
+				m.scrollActiveTableTop()
+				m.status = "Events: " + m.eventLevelLabel()
+				return m, nil
+			}
+
+		case "c":
+			// Clear the event log (Events tab only).
+			if !m.anySearching() && m.activeTab == tabEvents {
+				n := len(m.events)
+				m.events = nil
+				m.eventsCursor = 0
+				m.rerenderActiveTable()
+				m.scrollActiveTableTop()
+				m.status = fmt.Sprintf("Cleared %d events", n)
+				return m, nil
+			}
+
+		case "b":
+			// Record the current listeners as the expected set.
+			if !m.anySearching() {
+				if len(m.ports) == 0 {
+					m.status = "No listeners collected yet"
+					return m, nil
+				}
+				m.setBaseline()
+				m.rerenderActiveTable()
+				m.status = fmt.Sprintf("Baseline saved: %d listeners", len(m.baselineRaw))
+				return m, nil
+			}
+
+		case "B":
+			// Forget the expected listener set.
+			if !m.anySearching() {
+				if !m.hasBaseline() {
+					m.status = "No baseline saved"
+					return m, nil
+				}
+				m.clearBaseline()
+				m.rerenderActiveTable()
+				m.status = "Baseline cleared"
+				return m, nil
 			}
 		}
 	}
@@ -1048,9 +1365,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// Table tabs (ports / procs / conns): row-cursor navigation, falling back
-	// to viewport scrolling for non-navigation messages (e.g. mouse wheel).
-	if m.isTableTab() {
+	// Events search mode
+	if m.activeTab == tabEvents && m.eventsSearching {
+		var cmd tea.Cmd
+		m.eventsSearch, cmd = m.eventsSearch.Update(msg)
+
+		if km, ok := msg.(tea.KeyMsg); ok {
+			switch km.String() {
+			case "enter":
+				m.eventsQuery = strings.TrimSpace(m.eventsSearch.Value())
+				m.eventsSearching = false
+				m.eventsSearch.Blur()
+				m.eventsCursor = 0
+				m.rerenderActiveTable()
+				m.scrollActiveTableTop()
+				return m, nil
+
+			case "esc":
+				m.eventsSearching = false
+				m.eventsSearch.Blur()
+				return m, nil
+
+			case "ctrl+u":
+				m.eventsSearch.SetValue("")
+				return m, cmd
+			}
+		}
+		return m, cmd
+	}
+
+	// Row-cursor tabs: cursor navigation, falling back to viewport scrolling
+	// for non-navigation messages (e.g. mouse wheel).
+	if m.hasRowCursor() {
 		if handled, cmd := m.tableNav(msg); handled {
 			return m, cmd
 		}
@@ -1081,9 +1427,11 @@ func (m Model) View() string {
 		body = m.viewProcs()
 	case m.activeTab == tabConns:
 		body = m.viewConns()
+	case m.activeTab == tabEvents:
+		body = m.viewEvents()
 	}
 
-	footer := subtleStyle.Render("Keys: ? help • 1-5 tabs • / search • ↑↓ select • enter details • s/S sort • f/o/p/v filter • y copy • e export • x kill • space pause • +/- rate")
+	footer := subtleStyle.Render("Keys: ? help • 1-6 tabs • / search • n/N jump • ↑↓ select • enter details • s/S sort • t totals • z closed • f/o/p/v/u filter • b baseline • y copy • e export • x kill • R refresh")
 	if m.status != "" {
 		footer = okStyle.Render(m.status)
 	}
@@ -1104,9 +1452,10 @@ func (m Model) renderHeader() string {
 		renderTab("3 Ports", m.activeTab == tabPorts),
 		renderTab("4 Processes", m.activeTab == tabProcs),
 		renderTab("5 Connections", m.activeTab == tabConns),
+		renderTab(eventsTabLabel(m.events), m.activeTab == tabEvents),
 	}
 
-	left := titleStyle.Render("ducknetview 🦆 0.0.5") + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
+	left := titleStyle.Render("ducknetview 🦆 "+version.Version) + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
 	if m.paused {
 		left += " " + warnStyle.Render("⏸ PAUSED")
 	}
@@ -1140,7 +1489,7 @@ func (m Model) renderHelp() string {
 	b.WriteString(titleStyle.Render("ducknetview 🦆 — key bindings") + "\n\n")
 
 	section("Navigation")
-	row("1–5", "jump directly to a tab")
+	row("1–6", "jump directly to a tab")
 	row("←/→, tab", "switch / cycle tabs")
 	row("↑↓ (k/j)", "move row cursor / interface selection")
 	row("PgUp/PgDn", "page the cursor")
@@ -1149,31 +1498,52 @@ func (m Model) renderHelp() string {
 	b.WriteString("\n")
 
 	section("Actions")
-	row("enter", "show full details for the highlighted row")
+	row("enter", "row details (↑↓ scrolls, y copies, any key closes)")
 	row("y", "copy highlighted row / selected interface")
 	row("e", "export the current table to a CSV file")
 	row("x", "signal the row's process (t/k/h = TERM/KILL/HUP)")
 	row("s / S", "cycle sort column / reverse direction")
-	row("/", "search (Enter apply · Esc exit · Ctrl+u clear)")
+	row("click", "click a column header to sort by it, again to reverse")
+	row("t", "throughput columns: current rate / session total")
 	row("h", "toggle hide-noise interface filter")
 	row("ctrl+e", "refresh external IP now")
+	b.WriteString("\n")
+
+	section("Search")
+	row("/", "search (Enter apply · Esc exit · Ctrl+u clear)")
+	row("re:…", "treat the query as a regular expression")
+	row("\\", "switch between filtering rows and highlighting them")
+	row("n / N", "jump to the next / previous match")
 	b.WriteString("\n")
 
 	section("Refresh")
 	row("space", "pause / resume auto-refresh")
 	row("+ / -", "faster / slower refresh interval")
+	row("R", "refresh everything now")
 	b.WriteString("\n")
 
-	section("Filters (Ports / Connections)")
+	section("Filters (Ports / Processes / Connections)")
 	row("p", "cycle protocol filter (all / tcp / udp)")
 	row("v", "cycle IP version filter (all / v4 / v6)")
 	row("f", "cycle connection state (all / established / active)")
 	row("o", "connections: show public remotes only")
+	row("u", "show only my processes")
 	b.WriteString("\n")
 
 	section("Connections tab")
 	row("r", "toggle reverse DNS for remote addresses")
 	row("g", "toggle grouping by remote host")
+	row("z", "show connections that have closed, with final totals")
+	b.WriteString("\n")
+
+	section("Listener baseline")
+	row("b", "save the current listeners as the expected set")
+	row("B", "clear the saved baseline")
+	b.WriteString("\n")
+
+	section("Events tab")
+	row("l", "cycle the level filter (all / warn+ / alerts)")
+	row("c", "clear the recorded events")
 	b.WriteString("\n")
 
 	section("General")
@@ -1230,6 +1600,13 @@ func (m Model) viewOverview() string {
 	if watch > 0 {
 		sec += " · " + errStyle.Render(fmt.Sprintf("%d watchlist hits", watch))
 	}
+	if m.hasBaseline() {
+		if n := m.offBaselineCount(); n > 0 {
+			sec += " · " + errStyle.Render(fmt.Sprintf("%d off-baseline", n))
+		} else {
+			sec += " · " + okStyle.Render("baseline clean")
+		}
+	}
 	b.WriteString(sec + "\n\n")
 
 	b.WriteString(titleStyle.Render("Selected interface") + "\n")
@@ -1242,14 +1619,24 @@ func (m Model) viewOverview() string {
 	// Aggregate throughput across all real interfaces (loopback excluded).
 	chartW := max(10, details-6)
 	b.WriteString(titleStyle.Render("Total (all interfaces)") + "\n")
-	b.WriteString(fmt.Sprintf("RX %s  (peak %s)\n%s\n",
+	b.WriteString(fmt.Sprintf("RX %s  (session peak %s)\n%s\n",
 		probe.HumanBytesPerSec(lastOr0(m.totalRxHist)),
-		subtleStyle.Render(probe.HumanBytesPerSec(maxOf(m.totalRxHist))),
+		subtleStyle.Render(probe.HumanBytesPerSec(m.totalPeak.rx)),
 		Spark(m.totalRxHist, chartW)))
-	b.WriteString(fmt.Sprintf("TX %s  (peak %s)\n%s\n\n",
+	b.WriteString(fmt.Sprintf("TX %s  (session peak %s)\n%s\n\n",
 		probe.HumanBytesPerSec(lastOr0(m.totalTxHist)),
-		subtleStyle.Render(probe.HumanBytesPerSec(maxOf(m.totalTxHist))),
+		subtleStyle.Render(probe.HumanBytesPerSec(m.totalPeak.tx)),
 		Spark(m.totalTxHist, chartW)))
+
+	// Top talkers are only worth the vertical space once traffic has been
+	// accounted, and only when the box is tall enough to hold them without
+	// pushing the external IP out of view.
+	if talkers := m.renderTopTalkers(details); talkers != "" {
+		used := strings.Count(b.String(), "\n")
+		if used+strings.Count(talkers, "\n")+3 <= m.bodyHeight() {
+			b.WriteString(talkers)
+		}
+	}
 
 	ext := m.externalIP
 	if ext == "" {
@@ -1290,7 +1677,7 @@ func (m Model) viewPorts() string {
 
 	searchLine := subtleStyle.Render("Press / to search")
 	if m.portsQuery != "" {
-		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.portsQuery) + subtleStyle.Render("  (press / to change, ctrl+u to clear)")
+		searchLine = m.searchStatus(m.portsQuery)
 	}
 	if m.portsSearching {
 		searchLine = m.portsSearch.View()
@@ -1311,7 +1698,7 @@ func (m Model) viewProcs() string {
 
 	searchLine := subtleStyle.Render("Press / to search")
 	if m.procsQuery != "" {
-		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.procsQuery) + subtleStyle.Render("  (press / to change, ctrl+u to clear)")
+		searchLine = m.searchStatus(m.procsQuery)
 	}
 	if m.procsSearching {
 		searchLine = m.procsSearch.View()
@@ -1332,7 +1719,7 @@ func (m Model) viewConns() string {
 
 	searchLine := subtleStyle.Render("Press / to search")
 	if m.connsQuery != "" {
-		searchLine = subtleStyle.Render("Filter: ") + titleStyle.Render(m.connsQuery) + subtleStyle.Render("  (press / to change, ctrl+u to clear)")
+		searchLine = m.searchStatus(m.connsQuery)
 	}
 	if m.connsSearching {
 		searchLine = m.connsSearch.View()
@@ -1342,7 +1729,64 @@ func (m Model) viewConns() string {
 	return boxStyle.Width(connsW).Height(connsH).Render(content)
 }
 
+// connsColumns is the flat Connections table's layout.
+func (m Model) connsColumns() colSpecs {
+	w := m.connsVP.Width
+	if w <= 0 {
+		w = 140
+	}
+	w -= gutterWidth
+
+	colProto := 4
+	colSvc := 9
+	colState := 11
+	colAge := 6
+	colRate := 5
+	colRTT := 6
+	colRTX := 4
+	colPID := 7
+
+	// Remaining width split between LOCAL, REMOTE, PROCESS.
+	fixed := colProto + 2 + colSvc + 2 + colState + 2 + colAge + 2 + colPID + 2
+	if m.hasThroughput {
+		fixed += 2*(colRate+2) + colRTT + 2 + colRTX + 2
+	}
+	rest := w - fixed
+	if rest < 30 {
+		rest = 30
+	}
+	colLocal := max(16, min(28, rest/3))
+	colRemote := max(18, min(32, rest/3))
+	colProc := rest - colLocal - colRemote - 4
+	if colProc < 8 {
+		colProc = 8
+	}
+
+	cols := colSpecs{
+		{key: "proto", title: "PR", width: colProto, sort: "proto"},
+		{key: "local", title: "LOCAL", width: colLocal, sort: "local"},
+		{key: "remote", title: "REMOTE", width: colRemote, sort: "remote"},
+		{key: "svc", title: "SVC", width: colSvc},
+		{key: "state", title: "STATE", width: colState, sort: "state"},
+		{key: "age", title: "AGE", width: colAge, sort: "age"},
+	}
+	if m.hasThroughput {
+		rxHdr, txHdr := m.trafficHeaders()
+		cols = append(cols,
+			colSpec{key: "rx", title: rxHdr, width: colRate, sort: "rx"},
+			colSpec{key: "tx", title: txHdr, width: colRate, sort: "tx"},
+			colSpec{key: "rtt", title: "RTT", width: colRTT, sort: "rtt"},
+			colSpec{key: "rtx", title: "RTX", width: colRTX, sort: "retrans"})
+	}
+	return append(cols,
+		colSpec{key: "pid", title: "PID", width: colPID, sort: "pid"},
+		colSpec{key: "process", title: "PROCESS", width: colProc, sort: "process"})
+}
+
 func (m Model) renderConnsText() string {
+	if m.showClosed {
+		return m.renderConnsClosed()
+	}
 	if m.connsGroup {
 		return m.renderConnsGrouped()
 	}
@@ -1355,22 +1799,18 @@ func (m Model) renderConnsText() string {
 	}
 	w -= gutterWidth // rows are prefixed with the cursor gutter
 
-	colProto := 4
-	colState := 11
-	colAge := 6
-	colPID := 7
-
-	// Remaining width split between LOCAL, REMOTE, PROCESS.
-	rest := w - (colProto + 2 + colState + 2 + colAge + 2 + colPID + 1)
-	if rest < 30 {
-		rest = 30
-	}
-	colLocal := max(16, min(28, rest/3))
-	colRemote := max(18, min(32, rest/3))
-	colProc := rest - colLocal - colRemote - 4
-	if colProc < 8 {
-		colProc = 8
-	}
+	cols := m.connsColumns()
+	colProto := cols.width("proto")
+	colLocal := cols.width("local")
+	colRemote := cols.width("remote")
+	colSvc := cols.width("svc")
+	colState := cols.width("state")
+	colAge := cols.width("age")
+	colRate := cols.width("rx")
+	colRTT := cols.width("rtt")
+	colRTX := cols.width("rtx")
+	colPID := cols.width("pid")
+	colProc := cols.width("process")
 
 	sub := "↑↓ select • s/S sort: " + m.sortLabel() + " • y copy"
 	if m.connSeen && (m.connAdded > 0 || m.connRemoved > 0) {
@@ -1384,17 +1824,8 @@ func (m Model) renderConnsText() string {
 	b.WriteString("Active connections (non-listening)\n")
 	b.WriteString(sub + "\n\n")
 
-	h := fmt.Sprintf("%s  %s  %s  %s  %s  %s %s\n",
-		padRight("PR", colProto),
-		padRight("LOCAL", colLocal),
-		padRight("REMOTE", colRemote),
-		padRight("STATE", colState),
-		padRight("AGE", colAge),
-		padRight("PID", colPID),
-		"PROCESS",
-	)
-	b.WriteString(gutter(false) + h)
-	b.WriteString(gutter(false) + strings.Repeat("─", min(w, colProto+2+colLocal+2+colRemote+2+colState+2+colAge+2+colPID+1+colProc)) + "\n")
+	b.WriteString(gutter(false) + cols.header(m.sortKey(), m.sortDesc()) + "\n")
+	b.WriteString(gutter(false) + strings.Repeat("─", min(w, cols.span())) + "\n")
 
 	rows := m.filteredConns()
 	if len(rows) == 0 {
@@ -1402,7 +1833,7 @@ func (m Model) renderConnsText() string {
 		return b.String()
 	}
 
-	q := m.connsQuery
+	q := newMatcher(m.connsQuery)
 	now := time.Now()
 
 	for i, c := range rows {
@@ -1418,7 +1849,7 @@ func (m Model) renderConnsText() string {
 		if m.newConns[connKey(c)] {
 			proto = newConnStyle.Render(protoCell) // connection new since last poll
 		}
-		local := highlightFold(padRight(trunc(c.Local, colLocal), colLocal), q)
+		local := q.highlight(padRight(trunc(c.Local, colLocal), colLocal))
 		// Watchlist hits win the color; otherwise color the remote by IP scope
 		// when not searching, or show the search highlight (mixing scope color
 		// with reverse-video is unreadable).
@@ -1427,21 +1858,78 @@ func (m Model) renderConnsText() string {
 		switch {
 		case m.isWatched(c.Remote):
 			remote = watchStyle.Render(remoteCell)
-		case q == "":
+		case q.empty():
 			remote = scopeStyle(probe.IPScope(stripPort(c.Remote))).Render(remoteCell)
 		default:
-			remote = highlightFold(remoteCell, q)
+			remote = q.highlight(remoteCell)
 		}
+		svc := q.highlight(padRight(trunc(probe.ServiceName(portOf(c.Remote), c.Proto), colSvc), colSvc))
 		// Pad before coloring so the ANSI codes don't throw off rune-based width.
 		state := stateStyle(c.State).Render(padRight(trunc(c.State, colState), colState))
 		age := padRight(trunc(formatAge(now, m.connFirstSeen[connKey(c)]), colAge), colAge)
 		pid := padRight(fmt.Sprintf("%d", c.PID), colPID)
-		procTr := highlightFold(trunc(proc, colProc), q)
+		procTr := q.highlight(trunc(proc, colProc))
 
-		b.WriteString(gutter(i == m.connsCursor) + fmt.Sprintf("%s  %s  %s  %s  %s  %s %s\n", proto, local, remote, state, age, pid, procTr))
+		rateSeg := ""
+		if m.hasThroughput {
+			rx, tx := m.trafficCells(m.connRate(c), m.connTotal(c), colRate)
+			// Retransmits are the difference between "slow" and "lossy", so a
+			// non-zero count is called out rather than just printed.
+			rtx := padRight(formatRetrans(c.Retrans), colRTX)
+			if c.Retrans > 0 {
+				rtx = warnStyle.Render(rtx)
+			} else {
+				rtx = subtleStyle.Render(rtx)
+			}
+			rateSeg = rx + colSep + tx + colSep + padRight(formatRTT(c.RTT), colRTT) + colSep + rtx + colSep
+		}
+
+		b.WriteString(gutter(i == m.connsCursor) + fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s%s  %s\n",
+			proto, local, remote, svc, state, age, rateSeg, pid, procTr))
 	}
 
 	return b.String()
+}
+
+// groupColumns is the grouped-by-host view's layout.
+func (m Model) groupColumns() colSpecs {
+	w := m.connsVP.Width
+	if w <= 0 {
+		w = 140
+	}
+	w -= gutterWidth
+
+	colRemote := max(18, min(40, w/3))
+	colCount := 6
+	colRate := 5
+
+	fixed := colRemote + 2 + colCount + 2
+	if m.hasThroughput {
+		fixed += 2 * (colRate + 2)
+	}
+	rest := w - fixed
+	if rest < 20 {
+		rest = 20
+	}
+	colStates := max(12, rest/2)
+	colProc := rest - colStates - 2
+	if colProc < 8 {
+		colProc = 8
+	}
+
+	cols := colSpecs{
+		{key: "host", title: "REMOTE", width: colRemote, sort: "host"},
+		{key: "count", title: "CONNS", width: colCount, sort: "conns"},
+	}
+	if m.hasThroughput {
+		rxHdr, txHdr := m.trafficHeaders()
+		cols = append(cols,
+			colSpec{key: "rx", title: rxHdr, width: colRate, sort: "bytes"},
+			colSpec{key: "tx", title: txHdr, width: colRate, sort: "bytes"})
+	}
+	return append(cols,
+		colSpec{key: "states", title: "STATES", width: colStates},
+		colSpec{key: "procs", title: "PROCESSES", width: colProc})
 }
 
 // renderConnsGrouped renders the connections tab collapsed by remote host:
@@ -1454,20 +1942,14 @@ func (m Model) renderConnsGrouped() string {
 	if w <= 0 {
 		w = 140
 	}
-	w -= gutterWidth // rows are prefixed with the cursor gutter
+	w -= gutterWidth
 
-	colRemote := max(18, min(40, w/3))
-	colCount := 6
-
-	rest := w - (colRemote + 2 + colCount + 2)
-	if rest < 20 {
-		rest = 20
-	}
-	colStates := max(12, rest/2)
-	colProc := rest - colStates - 2
-	if colProc < 8 {
-		colProc = 8
-	}
+	cols := m.groupColumns()
+	colRemote := cols.width("host")
+	colCount := cols.width("count")
+	colRate := cols.width("rx")
+	colStates := cols.width("states")
+	colProc := cols.width("procs")
 
 	sub := "↑↓ select • s/S sort: " + m.sortLabel() + " • y copy"
 	if m.anyFilterActive() {
@@ -1476,13 +1958,8 @@ func (m Model) renderConnsGrouped() string {
 	b.WriteString("Active connections grouped by remote host\n")
 	b.WriteString(sub + "\n\n")
 
-	b.WriteString(gutter(false) + fmt.Sprintf("%s  %s  %s  %s\n",
-		padRight("REMOTE", colRemote),
-		padRight("CONNS", colCount),
-		padRight("STATES", colStates),
-		"PROCESSES",
-	))
-	b.WriteString(gutter(false) + strings.Repeat("─", min(w, colRemote+2+colCount+2+colStates+2+colProc)) + "\n")
+	b.WriteString(gutter(false) + cols.header(m.sortKey(), m.sortDesc()) + "\n")
+	b.WriteString(gutter(false) + strings.Repeat("─", min(w, cols.span())) + "\n")
 
 	groups := m.filteredGroups()
 	if len(groups) == 0 {
@@ -1490,7 +1967,7 @@ func (m Model) renderConnsGrouped() string {
 		return b.String()
 	}
 
-	q := m.connsQuery
+	q := newMatcher(m.connsQuery)
 
 	for i, g := range groups {
 		host := g.ip
@@ -1508,19 +1985,55 @@ func (m Model) renderConnsGrouped() string {
 		switch {
 		case m.isWatchedIP(g.ip):
 			remoteCol = watchStyle.Render(hostCell)
-		case q == "":
+		case q.empty():
 			remoteCol = scopeStyle(probe.IPScope(g.ip)).Render(hostCell)
 		default:
-			remoteCol = highlightFold(hostCell, q)
+			remoteCol = q.highlight(hostCell)
 		}
 		countCol := padRight(fmt.Sprintf("%d", g.count), colCount)
 		statesCol := padRight(trunc(states, colStates), colStates)
-		procCol := highlightFold(trunc(procs, colProc), q)
+		procCol := q.highlight(trunc(procs, colProc))
 
-		b.WriteString(gutter(i == m.connsCursor) + fmt.Sprintf("%s  %s  %s  %s\n", remoteCol, countCol, statesCol, procCol))
+		rateSeg := ""
+		if m.hasThroughput {
+			rx, tx := m.trafficCells(m.groupRate(g), m.hostTotal(g.ip), colRate)
+			rateSeg = rx + colSep + tx + colSep
+		}
+
+		b.WriteString(gutter(i == m.connsCursor) + fmt.Sprintf("%s  %s  %s%s  %s\n",
+			remoteCol, countCol, rateSeg, statesCol, procCol))
 	}
 
 	return b.String()
+}
+
+// portsColumns is the Ports table's layout: the single description the header,
+// the rows and the click-to-sort hit-testing all read.
+func (m Model) portsColumns() colSpecs {
+	w := m.portsVP.Width
+	if w <= 0 {
+		w = 120
+	}
+	w -= gutterWidth // rows are prefixed with the cursor gutter
+
+	colProto := 4
+	colSvc := 10
+	colUser := 10
+	colPID := 7
+	colLocal := min(30, max(16, w-colProto-colSvc-colUser-colPID-2-2-2-2-1-10))
+	rest := w - (colProto + 2 + colLocal + 2 + colSvc + 2 + colUser + 2 + colPID + 2)
+	if rest < 5 {
+		rest = 5
+	}
+
+	return colSpecs{
+		{key: "proto", title: "PR", width: colProto, sort: "proto"},
+		{key: "local", title: "LOCAL", width: colLocal, sort: "port"},
+		{key: "svc", title: "SERVICE", width: colSvc},
+		{key: "user", title: "USER", width: colUser, sort: "user"},
+		{key: "pid", title: "PID", width: colPID, sort: "pid"},
+		{key: "process", title: "PROCESS", width: rest, sort: "process"},
+	}
 }
 
 func (m Model) renderPortsText() string {
@@ -1530,31 +2043,31 @@ func (m Model) renderPortsText() string {
 	if w <= 0 {
 		w = 120
 	}
-	w -= gutterWidth // rows are prefixed with the cursor gutter
+	w -= gutterWidth
 
-	colProto := 4
-	colSvc := 10
-	colPID := 7
-	colLocal := min(30, max(16, w-colProto-colSvc-colPID-2-2-2-1-10))
+	cols := m.portsColumns()
+	colProto := cols.width("proto")
+	colLocal := cols.width("local")
+	colSvc := cols.width("svc")
+	colUser := cols.width("user")
+	colPID := cols.width("pid")
+	rest := cols.width("process")
 
 	sub := "↑↓ select • s/S sort: " + m.sortLabel() + " • y copy"
 	if m.portSeen && len(m.newPorts) > 0 {
 		sub += " • " + newConnStyle.Render(fmt.Sprintf("%d new", len(m.newPorts)))
 	}
-	if m.protoFilter != 0 || m.ipVerFilter != 0 {
+	if n := m.offBaselineCount(); n > 0 {
+		sub += " • " + errStyle.Render(fmt.Sprintf("%d off-baseline", n))
+	}
+	if m.protoFilter != 0 || m.ipVerFilter != 0 || m.onlyMine {
 		sub += " • filter: " + m.filterLabel()
 	}
 	b.WriteString("Open listening ports\n")
 	b.WriteString(sub + "\n\n")
 
-	b.WriteString(gutter(false) + fmt.Sprintf("%s  %s  %s  %s %s\n",
-		padRight("PR", colProto),
-		padRight("LOCAL", colLocal),
-		padRight("SERVICE", colSvc),
-		padRight("PID", colPID),
-		"PROCESS",
-	))
-	b.WriteString(gutter(false) + strings.Repeat("─", min(w, colProto+2+colLocal+2+colSvc+2+colPID+1+7)) + "\n")
+	b.WriteString(gutter(false) + cols.header(m.sortKey(), m.sortDesc()) + "\n")
+	b.WriteString(gutter(false) + strings.Repeat("─", min(w, cols.span())) + "\n")
 
 	rows := m.filteredPorts()
 	if len(rows) == 0 {
@@ -1562,11 +2075,7 @@ func (m Model) renderPortsText() string {
 		return b.String()
 	}
 
-	q := m.portsQuery
-	rest := w - (colProto + 2 + colLocal + 2 + colSvc + 2 + colPID + 1)
-	if rest < 5 {
-		rest = 5
-	}
+	q := newMatcher(m.portsQuery)
 
 	for i, p := range rows {
 		proc := p.Process
@@ -1580,7 +2089,12 @@ func (m Model) renderPortsText() string {
 
 		protoCell := padRight(trunc(p.Proto, colProto), colProto)
 		proto := protoCell
-		if m.newPorts[portKey(p)] {
+		switch {
+		case m.offBaseline(p):
+			// Unexpected listeners outrank merely-new ones: this one is not in
+			// the set the user declared normal.
+			proto = errStyle.Render(protoCell)
+		case m.newPorts[portKey(p)]:
 			proto = newConnStyle.Render(protoCell) // listener new since last poll
 		}
 		// Color the bind address by exposure when not searching (exposed listeners
@@ -1588,21 +2102,75 @@ func (m Model) renderPortsText() string {
 		localCell := padRight(trunc(local, colLocal), colLocal)
 		var localTr string
 		switch {
-		case q != "":
-			localTr = highlightFold(localCell, q)
+		case !q.empty():
+			localTr = q.highlight(localCell)
 		case local != "-":
 			localTr = exposureStyle(probe.ListenerExposure(stripPort(p.Local))).Render(localCell)
 		default:
 			localTr = localCell
 		}
-		svcTr := highlightFold(padRight(trunc(probe.ServiceName(portOf(p.Local), p.Proto), colSvc), colSvc), q)
-		procTr := highlightFold(trunc(proc, rest), q)
+		svcTr := q.highlight(padRight(trunc(probe.ServiceName(portOf(p.Local), p.Proto), colSvc), colSvc))
+		userTr := q.highlight(padRight(trunc(userOrDash(p.User), colUser), colUser))
+		procTr := q.highlight(trunc(proc, rest))
 		pid := padRight(fmt.Sprintf("%d", p.PID), colPID)
 
-		b.WriteString(gutter(i == m.portsCursor) + fmt.Sprintf("%s  %s  %s  %s %s\n", proto, localTr, svcTr, pid, procTr))
+		b.WriteString(gutter(i == m.portsCursor) + fmt.Sprintf("%s  %s  %s  %s  %s  %s\n", proto, localTr, svcTr, userTr, pid, procTr))
 	}
 
 	return b.String()
+}
+
+// procsColumns is the Processes table's layout. The CONTAINER column only earns
+// its width on a host actually running containers, and the throughput columns
+// only where the kernel can account for sockets.
+func (m Model) procsColumns() colSpecs {
+	w := m.procsVP.Width
+	if w <= 0 {
+		w = 120
+	}
+	w -= gutterWidth
+
+	colPID := 7
+	colUser := 10
+	colCont := 12
+	colCPU := 6
+	colMem := 6
+	colRate := 5
+	colConns := 6
+	colListen := 6
+
+	showCont := m.anyContainer()
+
+	// Seven base columns, so six two-space separators.
+	fixed := colPID + colUser + colCPU + colMem + colConns + colListen + 12
+	if showCont {
+		fixed += colCont + 2
+	}
+	if m.hasThroughput {
+		fixed += 2 * (colRate + 2)
+	}
+	colName := clampInt(w-fixed, 14, 34)
+
+	cols := colSpecs{
+		{key: "pid", title: "PID", width: colPID, sort: "pid"},
+		{key: "name", title: "NAME", width: colName, sort: "name"},
+		{key: "user", title: "USER", width: colUser, sort: "user"},
+	}
+	if showCont {
+		cols = append(cols, colSpec{key: "container", title: "CONTAINER", width: colCont})
+	}
+	cols = append(cols,
+		colSpec{key: "cpu", title: "CPU%", width: colCPU, sort: "cpu"},
+		colSpec{key: "mem", title: "MEM%", width: colMem, sort: "mem"})
+	if m.hasThroughput {
+		rxHdr, txHdr := m.trafficHeaders()
+		cols = append(cols,
+			colSpec{key: "rx", title: rxHdr, width: colRate, sort: "rx"},
+			colSpec{key: "tx", title: txHdr, width: colRate, sort: "tx"})
+	}
+	return append(cols,
+		colSpec{key: "conns", title: "CONNS", width: colConns, sort: "conns"},
+		colSpec{key: "listen", title: "LISTEN", width: colListen, sort: "listen"})
 }
 
 func (m Model) renderProcsText() string {
@@ -1612,37 +2180,29 @@ func (m Model) renderProcsText() string {
 	if w <= 0 {
 		w = 120
 	}
-	w -= gutterWidth // rows are prefixed with the cursor gutter
+	w -= gutterWidth
 
-	colPID := 7
-	colCPU := 6
-	colMem := 6
-	colConns := 6
-	colListen := 6
-
-	minName := 14
-	// 5 two-space separators between the six columns.
-	colName := w - (colPID + colCPU + colMem + colConns + colListen + 10)
-	if colName < minName {
-		colName = minName
-	}
-	if colName > 34 {
-		colName = 34
-	}
+	cols := m.procsColumns()
+	showCont := m.anyContainer()
+	colPID := cols.width("pid")
+	colName := cols.width("name")
+	colUser := cols.width("user")
+	colCont := cols.width("container")
+	colCPU := cols.width("cpu")
+	colMem := cols.width("mem")
+	colRate := cols.width("rx")
+	colConns := cols.width("conns")
+	colListen := cols.width("listen")
 
 	b.WriteString("Processes by network connections (proxy)\n")
-	b.WriteString("↑↓ select • s/S sort: " + m.sortLabel() + " • y copy\n\n")
+	sub := "↑↓ select • s/S sort: " + m.sortLabel() + " • y copy"
+	if m.onlyMine {
+		sub += " • filter: " + m.filterLabel()
+	}
+	b.WriteString(sub + "\n\n")
 
-	h := fmt.Sprintf("%s  %s  %s  %s  %s  %s\n",
-		padRight("PID", colPID),
-		padRight("NAME", colName),
-		padRight("CPU%", colCPU),
-		padRight("MEM%", colMem),
-		padRight("CONNS", colConns),
-		padRight("LISTEN", colListen),
-	)
-	b.WriteString(gutter(false) + h)
-	b.WriteString(gutter(false) + strings.Repeat("─", min(w, colPID+2+colName+2+colCPU+2+colMem+2+colConns+2+colListen)) + "\n")
+	b.WriteString(gutter(false) + cols.header(m.sortKey(), m.sortDesc()) + "\n")
+	b.WriteString(gutter(false) + strings.Repeat("─", min(w, cols.span())) + "\n")
 
 	rows := m.filteredProcs()
 	if len(rows) == 0 {
@@ -1650,7 +2210,7 @@ func (m Model) renderProcsText() string {
 		return b.String()
 	}
 
-	q := m.procsQuery
+	q := newMatcher(m.procsQuery)
 
 	for i, p := range rows {
 		name := p.Name
@@ -1658,14 +2218,33 @@ func (m Model) renderProcsText() string {
 			name = "-"
 		}
 
-		pidS := highlightFold(padRight(trunc(fmt.Sprintf("%d", p.PID), colPID), colPID), q)
-		nameS := highlightFold(padRight(trunc(name, colName), colName), q)
+		pidS := q.highlight(padRight(trunc(fmt.Sprintf("%d", p.PID), colPID), colPID))
+		nameS := q.highlight(padRight(trunc(name, colName), colName))
+		userS := q.highlight(padRight(trunc(userOrDash(p.User), colUser), colUser))
 		cpuS := padRight(trunc(fmt.Sprintf("%.1f", p.CPU), colCPU), colCPU)
 		memS := padRight(trunc(fmt.Sprintf("%.1f", p.Mem), colMem), colMem)
 		conS := padRight(trunc(fmt.Sprintf("%d", p.ConnCount), colConns), colConns)
 		lisS := padRight(trunc(fmt.Sprintf("%d", p.ListenCount), colListen), colListen)
 
-		b.WriteString(gutter(i == m.procsCursor) + fmt.Sprintf("%s  %s  %s  %s  %s  %s\n", pidS, nameS, cpuS, memS, conS, lisS))
+		contS := ""
+		if showCont {
+			cell := padRight(trunc(dashIfEmpty(p.Container), colCont), colCont)
+			if p.Container == "" {
+				cell = subtleStyle.Render(cell)
+			} else {
+				cell = q.highlight(cell)
+			}
+			contS = cell + colSep
+		}
+
+		rateSeg := ""
+		if m.hasThroughput {
+			rx, tx := m.trafficCells(m.procRate(p.PID), m.procTotal(p.PID), colRate)
+			rateSeg = rx + colSep + tx + colSep
+		}
+
+		b.WriteString(gutter(i == m.procsCursor) + fmt.Sprintf("%s  %s  %s  %s%s  %s  %s%s\n",
+			pidS, nameS, userS, contS, cpuS, memS, rateSeg, conS+colSep+lisS))
 	}
 
 	return b.String()
@@ -1750,24 +2329,88 @@ func (m Model) renderIfaceDetailsText(avail int) string {
 		b.WriteString("Addrs: " + strings.Join(ii.Addrs, ", ") + "\n")
 	}
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("RX: %s  (total %s)\n%s\n\n",
-		probe.HumanBytesPerSec(ii.RxBps), subtleStyle.Render(probe.HumanBytes(ii.RxTotal)), rx))
-	b.WriteString(fmt.Sprintf("TX: %s  (total %s)\n%s\n",
-		probe.HumanBytesPerSec(ii.TxBps), subtleStyle.Render(probe.HumanBytes(ii.TxTotal)), tx))
+
+	peak := m.ifacePeaks[ii.Name]
+	b.WriteString(fmt.Sprintf("RX: %s  (total %s, peak %s)\n%s\n\n",
+		probe.HumanBytesPerSec(ii.RxBps),
+		subtleStyle.Render(probe.HumanBytes(ii.RxTotal)),
+		subtleStyle.Render(probe.HumanBytesPerSec(peak.rx)), rx))
+	b.WriteString(fmt.Sprintf("TX: %s  (total %s, peak %s)\n%s\n",
+		probe.HumanBytesPerSec(ii.TxBps),
+		subtleStyle.Render(probe.HumanBytes(ii.TxTotal)),
+		subtleStyle.Render(probe.HumanBytesPerSec(peak.tx)), tx))
+
+	b.WriteString("\n" + fitLine(avail,
+		fmt.Sprintf("Packets: %s in/s · %s out/s", formatCount(ii.RxPps), formatCount(ii.TxPps)),
+		fmt.Sprintf("Pkts %s/%s", formatCount(ii.RxPps), formatCount(ii.TxPps)),
+	) + "\n")
+
+	// Errors and drops are cumulative since boot; a non-zero count is worth
+	// pointing at even when the link is currently healthy.
+	link := fitLine(avail,
+		fmt.Sprintf("Errors: %d in / %d out · Drops: %d in / %d out", ii.Errin, ii.Errout, ii.Dropin, ii.Dropout),
+		fmt.Sprintf("Err %d/%d · Drop %d/%d", ii.Errin, ii.Errout, ii.Dropin, ii.Dropout),
+	)
+	if ii.LinkProblems() > 0 {
+		link = warnStyle.Render(link)
+	} else {
+		link = subtleStyle.Render(link)
+	}
+	b.WriteString(link + "\n")
+
 	return b.String()
+}
+
+// fitLine picks the fullest wording that fits the available width, falling back
+// to truncation if even the short form is too wide.
+func fitLine(avail int, long, short string) string {
+	if lipgloss.Width(long) <= avail {
+		return long
+	}
+	if lipgloss.Width(short) <= avail {
+		return short
+	}
+	return trunc(short, avail)
+}
+
+// formatCount renders a packets-per-second figure compactly.
+func formatCount(v float64) string {
+	switch {
+	case v < 1000:
+		return fmt.Sprintf("%.0f", v)
+	case v < 1_000_000:
+		return fmt.Sprintf("%.1fk", v/1000)
+	default:
+		return fmt.Sprintf("%.1fM", v/1_000_000)
+	}
+}
+
+func max64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // helpers
 
 // anySearching reports whether a search input is currently focused on any tab.
 func (m Model) anySearching() bool {
-	return m.portsSearching || m.procsSearching || m.connsSearching
+	return m.portsSearching || m.procsSearching || m.connsSearching || m.eventsSearching
 }
 
 // isTableTab reports whether the active tab is one of the sortable, cursor-
-// driven table tabs (ports / procs / conns).
+// driven table tabs (ports / procs / conns) that support sorting, filtering,
+// row details and process actions.
 func (m Model) isTableTab() bool {
 	return m.activeTab == tabPorts || m.activeTab == tabProcs || m.activeTab == tabConns
+}
+
+// hasRowCursor reports whether the active tab renders selectable rows. The
+// events tab has a cursor (for copy and export) but none of the table tabs'
+// sorting or process actions.
+func (m Model) hasRowCursor() bool {
+	return m.isTableTab() || m.activeTab == tabEvents
 }
 
 func padTo(width int, s string) string {
@@ -1781,13 +2424,9 @@ func padTo(width int, s string) string {
 	return strings.Repeat(" ", width-w) + s
 }
 
-// formatAge renders how long ago a connection was first seen, compactly (e.g.
-// "42s", "3m07s", "1h05m", "2d03h"). A zero first-seen time renders as "-".
-func formatAge(now, since time.Time) string {
-	if since.IsZero() {
-		return "-"
-	}
-	d := now.Sub(since)
+// formatDuration renders a duration compactly: "42s", "3m07s", "1h05m",
+// "2d03h".
+func formatDuration(d time.Duration) string {
 	if d < 0 {
 		d = 0
 	}
@@ -1801,6 +2440,15 @@ func formatAge(now, since time.Time) string {
 	default:
 		return fmt.Sprintf("%dd%02dh", int(d.Hours())/24, int(d.Hours())%24)
 	}
+}
+
+// formatAge renders how long ago a connection was first seen. A zero
+// first-seen time renders as "-".
+func formatAge(now, since time.Time) string {
+	if since.IsZero() {
+		return "-"
+	}
+	return formatDuration(now.Sub(since))
 }
 
 // lastOr0 returns the most recent value of a history series, or 0 if empty.
@@ -1918,6 +2566,50 @@ func ansiSafeTruncate(s string, maxWidth int) string {
 	return out.String()
 }
 
+// stripANSI removes escape sequences so styled text can go to the clipboard as
+// plain text.
+func stripANSI(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+
+	for i := 0; i < len(s); {
+		if s[i] != 0x1b {
+			out.WriteByte(s[i])
+			i++
+			continue
+		}
+		// CSI: ESC [ … final byte in 0x40-0x7E
+		if i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && (s[j] < 0x40 || s[j] > 0x7E) {
+				j++
+			}
+			i = min(j+1, len(s))
+			continue
+		}
+		// OSC: ESC ] … BEL or ST
+		if i+1 < len(s) && s[i+1] == ']' {
+			j := i + 2
+			for j < len(s) {
+				if s[j] == 0x07 {
+					j++
+					break
+				}
+				if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+					j += 2
+					break
+				}
+				j++
+			}
+			i = j
+			continue
+		}
+		i = min(i+2, len(s))
+	}
+
+	return out.String()
+}
+
 func joinTabsWithinWidth(tabs []string, maxW int) string {
 	if maxW <= 0 || len(tabs) == 0 {
 		return ""
@@ -1982,4 +2674,38 @@ func clampToWidthOneLine(s string, w int) string {
 		return ""
 	}
 	return ansiSafeTruncate(s, w)
+}
+
+// tabNames maps the --tab flag's values to tabs, so a session can start on the
+// view the user actually cares about.
+var tabNames = map[string]tab{
+	"overview":    tabOverview,
+	"interfaces":  tabIfaces,
+	"ports":       tabPorts,
+	"processes":   tabProcs,
+	"procs":       tabProcs,
+	"connections": tabConns,
+	"conns":       tabConns,
+	"events":      tabEvents,
+}
+
+// TabNames lists the accepted --tab values, for the flag's error message.
+func TabNames() []string {
+	out := make([]string, 0, len(tabNames))
+	for name := range tabNames {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// WithTab selects the initial tab by name. ok is false for an unknown name,
+// which the caller reports rather than silently ignoring.
+func (m Model) WithTab(name string) (Model, bool) {
+	t, ok := tabNames[strings.ToLower(strings.TrimSpace(name))]
+	if !ok {
+		return m, false
+	}
+	m.activeTab = t
+	return m, true
 }

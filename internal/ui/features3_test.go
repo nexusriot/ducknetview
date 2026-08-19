@@ -178,7 +178,7 @@ func TestExportWritesCSV(t *testing.T) {
 		t.Fatalf("read exported file: %v", err)
 	}
 	s := string(b)
-	if !strings.Contains(s, "proto,local,service,pid,process") || !strings.Contains(s, "nginx") {
+	if !strings.Contains(s, "proto,local,service,exposure,in_baseline,user,pid,process") || !strings.Contains(s, "nginx") {
 		t.Fatalf("unexpected CSV contents:\n%s", s)
 	}
 }

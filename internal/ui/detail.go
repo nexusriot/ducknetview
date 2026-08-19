@@ -3,6 +3,9 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/nexusriot/ducknetview/internal/probe"
 )
@@ -27,7 +30,10 @@ func (m Model) selectedPID() (int32, string, bool) {
 			}
 		}
 	case tabConns:
-		if !m.connsGroup {
+		// Grouped rows span several processes, and a closed connection's PID
+		// may already have been recycled onto an unrelated process — neither is
+		// safe to signal.
+		if !m.connsGroup && !m.showClosed {
 			rows := m.filteredConns()
 			if m.connsCursor >= 0 && m.connsCursor < len(rows) {
 				if c := rows[m.connsCursor]; c.PID > 0 {
@@ -37,6 +43,14 @@ func (m Model) selectedPID() (int32, string, bool) {
 		}
 	}
 	return 0, "", false
+}
+
+// timeOrDash formats a timestamp that may not have been recorded.
+func timeOrDash(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	return t.Format("2006-01-02 15:04:05")
 }
 
 // detailContent builds the multi-line body for the row-detail overlay for the
@@ -68,6 +82,9 @@ func (m Model) detailContent() (string, bool) {
 			kv("Exposure", probe.ListenerExposure(stripPort(p.Local)))
 		}
 		kv("Service", probe.ServiceName(portOf(p.Local), p.Proto))
+		if m.offBaseline(p) {
+			kv("Baseline", "NOT IN BASELINE")
+		}
 		kv("PID", fmt.Sprintf("%d", p.PID))
 		kv("Process", p.Process)
 		writeProcDetail(&b, kv, p.PID)
@@ -82,8 +99,16 @@ func (m Model) detailContent() (string, bool) {
 		kv("PID", fmt.Sprintf("%d", p.PID))
 		kv("Name", p.Name)
 		kv("User", p.User)
+		kv("Container", p.Container)
 		kv("CPU %", fmt.Sprintf("%.1f", p.CPU))
 		kv("Mem %", fmt.Sprintf("%.1f", p.Mem))
+		if m.hasThroughput {
+			r := m.procRate(p.PID)
+			t := m.procTotal(p.PID)
+			kv("RX", probe.HumanBytesPerSec(r.rx)+"   session "+probe.HumanBytes(t.rx))
+			kv("TX", probe.HumanBytesPerSec(r.tx)+"   session "+probe.HumanBytes(t.tx))
+			writeRateSparks(&b, m.procRateHist[p.PID], m.detailWidth())
+		}
 		kv("Conns", fmt.Sprintf("%d", p.ConnCount))
 		kv("Listening", fmt.Sprintf("%d", p.ListenCount))
 		if d, err := probe.ProcessDetail(p.PID); err == nil {
@@ -92,6 +117,33 @@ func (m Model) detailContent() (string, bool) {
 		}
 
 	case tabConns:
+		if m.showClosed {
+			rows := m.closedRows()
+			if m.connsCursor < 0 || m.connsCursor >= len(rows) {
+				return "", false
+			}
+			cc := rows[m.connsCursor]
+			c := cc.conn
+			b.WriteString(titleStyle.Render("Closed connection") + "\n\n")
+			kv("Protocol", c.Proto)
+			kv("Local", c.Local)
+			kv("Remote", m.dnsDisplay(c.Remote))
+			kv("Scope", probe.IPScope(stripPort(c.Remote)))
+			kv("Service", probe.ServiceName(portOf(c.Remote), c.Proto))
+			kv("Last state", c.State)
+			kv("Opened", timeOrDash(cc.firstSeen))
+			kv("Closed", cc.closedAt.Format("2006-01-02 15:04:05"))
+			kv("Lifetime", cc.lifetimeLabel())
+			kv("RX", probe.HumanBytes(cc.totals.rx))
+			kv("TX", probe.HumanBytes(cc.totals.tx))
+			if c.Retrans > 0 {
+				kv("Retrans", fmt.Sprintf("%d", c.Retrans))
+			}
+			kv("PID", fmt.Sprintf("%d", c.PID))
+			kv("Process", c.Process)
+			kv("User", c.User)
+			break
+		}
 		if m.connsGroup {
 			rows := m.filteredGroups()
 			if m.connsCursor < 0 || m.connsCursor >= len(rows) {
@@ -106,9 +158,16 @@ func (m Model) detailContent() (string, bool) {
 			}
 			b.WriteString(titleStyle.Render("Remote host group") + "\n\n")
 			kv("Host", host)
+			kv("Scope", probe.IPScope(g.ip))
 			kv("Conns", fmt.Sprintf("%d", g.count))
 			kv("States", formatStates(g.states))
 			kv("Processes", strings.Join(g.procs, ", "))
+			if m.hasThroughput {
+				r := m.groupRate(g)
+				t := m.hostTotal(g.ip)
+				kv("RX", probe.HumanBytesPerSec(r.rx)+"   session "+probe.HumanBytes(t.rx))
+				kv("TX", probe.HumanBytesPerSec(r.tx)+"   session "+probe.HumanBytes(t.tx))
+			}
 		} else {
 			rows := m.filteredConns()
 			if m.connsCursor < 0 || m.connsCursor >= len(rows) {
@@ -125,21 +184,70 @@ func (m Model) detailContent() (string, bool) {
 			}
 			kv("Service", probe.ServiceName(portOf(c.Remote), c.Proto))
 			kv("State", c.State)
+			kv("Age", formatAge(time.Now(), m.connFirstSeen[connKey(c)]))
+			if m.hasThroughput {
+				r := m.connRate(c)
+				kv("RX", probe.HumanBytesPerSec(r.rx)+"  (total "+probe.HumanBytes(c.RxBytes)+")")
+				kv("TX", probe.HumanBytesPerSec(r.tx)+"  (total "+probe.HumanBytes(c.TxBytes)+")")
+				if c.RTT > 0 {
+					rtt := c.RTT.Round(time.Millisecond / 10).String()
+					if c.MinRTT > 0 {
+						rtt += "   min " + c.MinRTT.Round(time.Millisecond/10).String()
+					}
+					kv("RTT", rtt)
+				}
+				// Retransmits mean loss on the path; a standing send queue means
+				// the peer is not draining what we hand it.
+				quality := fmt.Sprintf("%d retransmits · recv-q %d · send-q %d", c.Retrans, c.RecvQ, c.SendQ)
+				if !c.SocketHealthy() {
+					quality = warnStyle.Render(quality)
+				}
+				kv("Quality", quality)
+				writeRateSparks(&b, m.connRateHist[connKey(c)], m.detailWidth())
+			}
 			kv("PID", fmt.Sprintf("%d", c.PID))
 			kv("Process", c.Process)
 			writeProcDetail(&b, kv, c.PID)
 		}
 
+	case tabEvents:
+		rows := m.eventRows()
+		if m.eventsCursor < 0 || m.eventsCursor >= len(rows) {
+			return "", false
+		}
+		e := rows[m.eventsCursor]
+		b.WriteString(titleStyle.Render("Event") + "\n\n")
+		kv("Time", e.At.Format("2006-01-02 15:04:05 -07:00"))
+		kv("Level", e.Level.String())
+		kv("Kind", e.Kind)
+		kv("Subject", e.Subject)
+		kv("Detail", e.Detail)
+
 	default:
 		return "", false
 	}
 
-	b.WriteString("\n" + subtleStyle.Render("press any key to close"))
+	b.WriteString("\n" + subtleStyle.Render("↑↓ scroll • y copy • any other key closes"))
 	return b.String(), true
 }
 
-// writeProcDetail appends the owning user and command line for a PID, fetched
-// on demand (skipped silently if the process is gone or unreadable).
+// writeRateSparks draws the recent throughput of the selected row, so a
+// connection that is stalling (or that just finished a burst) is visible in the
+// overlay rather than only as a single instantaneous number.
+func writeRateSparks(b *strings.Builder, h *rateHistory, width int) {
+	if h == nil || len(h.rx) < 2 {
+		return
+	}
+	chartW := max(10, min(60, width-16))
+	b.WriteString("  " + okStyle.Render(padRight("RX chart", 10)) +
+		Spark(h.rx, chartW) + "  " + subtleStyle.Render("peak "+probe.CompactRate(maxOf(h.rx))) + "\n")
+	b.WriteString("  " + okStyle.Render(padRight("TX chart", 10)) +
+		Spark(h.tx, chartW) + "  " + subtleStyle.Render("peak "+probe.CompactRate(maxOf(h.tx))) + "\n")
+}
+
+// writeProcDetail appends the owning user, container and command line for a
+// PID, fetched on demand (skipped silently if the process is gone or
+// unreadable).
 func writeProcDetail(b *strings.Builder, kv func(k, v string), pid int32) {
 	if pid <= 0 {
 		return
@@ -149,13 +257,45 @@ func writeProcDetail(b *strings.Builder, kv func(k, v string), pid int32) {
 		return
 	}
 	kv("User", d.User)
+	if d.Container != "" {
+		kv("Container", d.Container)
+	}
 	kv("Command", d.Cmdline)
 }
 
+// detailWidth is the text width available inside the detail box.
+func (m Model) detailWidth() int {
+	return max(20, min(m.w-2, 120)-2)
+}
+
+// setDetail installs content in the overlay, wrapping it to the box width so
+// long command lines are readable in full instead of being cut off, and resets
+// the scroll position.
+func (m *Model) setDetail(text string) {
+	m.detailText = text
+	m.detailVP.Width = m.detailWidth()
+	m.detailVP.Height = max(3, m.bodyHeight()-2)
+	m.detailVP.SetContent(lipgloss.NewStyle().Width(m.detailVP.Width).Render(text))
+	m.detailVP.SetYOffset(0)
+}
+
+// refreshDetail re-renders the open overlay against the latest poll, so a
+// connection's throughput and state keep updating while it is being read.
+func (m *Model) refreshDetail() {
+	if !m.showDetail {
+		return
+	}
+	txt, ok := m.detailContent()
+	if !ok {
+		return
+	}
+	offset := m.detailVP.YOffset
+	m.setDetail(txt)
+	m.detailVP.SetYOffset(offset)
+}
+
 func (m Model) renderDetail() string {
-	boxW := min(m.w-2, 120)
-	return boxStyle.Width(boxW).Height(m.bodyHeight()).
-		Render(hardClipLinesToWidth(m.detailText, boxW-2))
+	return boxStyle.Width(min(m.w-2, 120)).Height(m.bodyHeight()).Render(m.detailVP.View())
 }
 
 func (m Model) renderKillConfirm() string {
