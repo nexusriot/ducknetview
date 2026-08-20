@@ -18,9 +18,15 @@ run: build
 
 install: build
 	install -Dm755 $(BINARY) $(DESTDIR)$(PREFIX)/bin/$(BINARY)
+	install -Dm644 man/$(BINARY).1 $(DESTDIR)$(PREFIX)/share/man/man1/$(BINARY).1
+	install -Dm644 completions/$(BINARY).bash $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(BINARY)
+	install -Dm644 completions/_$(BINARY) $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_$(BINARY)
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(BINARY)
+	rm -f $(DESTDIR)$(PREFIX)/share/man/man1/$(BINARY).1
+	rm -f $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(BINARY)
+	rm -f $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_$(BINARY)
 
 fmt:
 	$(GO) fmt ./...

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -88,7 +89,9 @@ func portKey(p probe.ListenPort) string {
 // remotes, and connections matching the watchlist.
 func (m Model) securityCounts() (exposed, public, watch int) {
 	for _, p := range m.ports {
-		if probe.ListenerExposure(stripPort(p.Local)) == "exposed" {
+		// Client sockets are not part of the host's exposure, and counting them
+		// would make this number twitch with every DNS query.
+		if probe.IsServiceListener(p) && probe.ListenerExposure(stripPort(p.Local)) == "exposed" {
 			exposed++
 		}
 	}
@@ -153,6 +156,9 @@ func (m Model) passConnFilters(c probe.Conn) bool {
 	if !m.passProtoFilter(c.Proto) || !m.passIPVerFilter(c.Remote) || !m.passUserFilter(c.User) {
 		return false
 	}
+	if !m.passIfaceFilter(c) {
+		return false
+	}
 	if m.publicOnly && probe.IPScope(stripPort(c.Remote)) != "public" {
 		return false
 	}
@@ -186,7 +192,8 @@ func (m Model) isWatchedIP(ip string) bool {
 // anyFilterActive reports whether a non-default quick filter is set (used to
 // decide whether to show the filter summary line).
 func (m Model) anyFilterActive() bool {
-	return m.connStateFilter != 0 || m.protoFilter != 0 || m.ipVerFilter != 0 || m.publicOnly || m.onlyMine
+	return m.connStateFilter != 0 || m.protoFilter != 0 || m.ipVerFilter != 0 ||
+		m.publicOnly || m.onlyMine || m.ifaceFilter != ""
 }
 
 // filterLabel describes the active quick filters, e.g. "tcp · established".
@@ -215,6 +222,9 @@ func (m Model) filterLabel() string {
 	}
 	if m.onlyMine {
 		parts = append(parts, "mine")
+	}
+	if m.ifaceFilter != "" {
+		parts = append(parts, m.ifaceFilter)
 	}
 	if len(parts) == 0 {
 		return "none"
@@ -262,9 +272,9 @@ func (m Model) filteredPorts() []probe.ListenPort {
 	return out
 }
 
-func (m Model) filteredProcs() []probe.ProcNet {
+func (m Model) filteredProcs() []procRow {
 	q := newMatcher(m.filterQuery(m.procsQuery))
-	out := make([]probe.ProcNet, 0, len(m.procs))
+	out := make([]procRow, 0, len(m.procs))
 	for _, p := range m.procs {
 		if !m.passUserFilter(p.User) {
 			continue
@@ -277,7 +287,10 @@ func (m Model) filteredProcs() []probe.ProcNet {
 		if !q.match(name, fmt.Sprintf("%d", p.PID), p.User, p.Container) {
 			continue
 		}
-		out = append(out, p)
+		out = append(out, procRow{ProcNet: p, members: 1, pids: []int32{p.PID}})
+	}
+	if m.aggregateProcs {
+		out = aggregateByName(out)
 	}
 	m.sortProcs(out)
 	return out
@@ -578,6 +591,10 @@ func (m Model) copyTarget() (text, what string, ok bool) {
 		if name == "" {
 			name = "-"
 		}
+		if p.members > 1 {
+			return fmt.Sprintf("%s\tprocs=%d\tconns=%d\tlisten=%d", name, p.members, p.ConnCount, p.ListenCount),
+				"process group", true
+		}
 		return fmt.Sprintf("%d\t%s\tconns=%d\tlisten=%d", p.PID, name, p.ConnCount, p.ListenCount), "process row", true
 
 	case tabConns:
@@ -650,8 +667,8 @@ func (m *Model) rebuildIfaceList() {
 		desc := fmt.Sprintf(
 			"%s  RX %s  TX %s",
 			ii.Kind.Label(),
-			probe.HumanBytesPerSec(ii.RxBps),
-			probe.HumanBytesPerSec(ii.TxBps),
+			m.rate(ii.RxBps),
+			m.rate(ii.TxBps),
 		)
 		desc = trunc(desc, descMax)
 		items = append(items, ifaceItem{name: ii.Name, desc: desc})
@@ -682,4 +699,81 @@ func (m *Model) rebuildIfaceList() {
 		m.ifaceList.Select(0)
 		m.selectedIface = items[0].(ifaceItem).name
 	}
+}
+
+// ifaceFor reports which interface a connection's local address belongs to,
+// from the map resolved at poll time.
+func (m Model) ifaceFor(c probe.Conn) string {
+	return m.connIface[connKey(c)]
+}
+
+// passIfaceFilter applies the interface filter, which answers the question the
+// Interfaces tab cannot: what is actually going over the VPN?
+func (m Model) passIfaceFilter(c probe.Conn) bool {
+	if m.ifaceFilter == "" {
+		return true
+	}
+	return m.ifaceFor(c) == m.ifaceFilter
+}
+
+// ifaceChoices lists the interfaces the current connections actually use, which
+// is what the `i` filter cycles through — offering every veth on a Docker host
+// would make the cycle useless.
+func (m Model) ifaceChoices() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range m.conns {
+		name := m.ifaceFor(c)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// cycleIfaceFilter advances the interface filter through the interfaces in use,
+// then back to showing all of them.
+func (m *Model) cycleIfaceFilter() {
+	choices := m.ifaceChoices()
+	if len(choices) == 0 {
+		m.status = "No interfaces to filter by yet"
+		return
+	}
+	if m.ifaceFilter == "" {
+		m.ifaceFilter = choices[0]
+	} else {
+		next := ""
+		for i, name := range choices {
+			if name == m.ifaceFilter && i+1 < len(choices) {
+				next = choices[i+1]
+				break
+			}
+		}
+		m.ifaceFilter = next
+	}
+	m.applyFilterChange()
+}
+
+// multiIface reports whether the current connections span more than one
+// interface, which is when naming the interface per row tells you anything.
+func (m Model) multiIface() bool {
+	first := ""
+	for _, c := range m.conns {
+		name := m.ifaceFor(c)
+		if name == "" {
+			continue
+		}
+		if first == "" {
+			first = name
+			continue
+		}
+		if name != first {
+			return true
+		}
+	}
+	// A filter pinned to one interface still needs the column to explain itself.
+	return m.ifaceFilter != ""
 }

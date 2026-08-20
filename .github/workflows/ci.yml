@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          check-latest: true
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: go vet ./...
+
+      - name: Build
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build ./...
+
+      # The netlink parsing reads fixed byte offsets out of kernel structs, so
+      # the tests are the only thing standing between a struct change and
+      # silently wrong numbers. They only run natively.
+      - name: Test
+        if: matrix.goarch == 'amd64'
+        run: go test -race ./...
+
+  crosscompile:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      # The non-Linux stub for the netlink probe has to keep compiling, or the
+      # portability claim quietly stops being true.
+      - name: Build for other platforms
+        env:
+          CGO_ENABLED: 0
+        run: |
+          for target in darwin/amd64 darwin/arm64 windows/amd64 freebsd/amd64; do
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build ./... || exit 1
+            echo "ok $target"
+          done
+
+  staticcheck:
+    name: staticcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+
+  deb:
+    name: debian packages
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Build packages
+        run: |
+          ./build-deb.sh amd64
+          ./build-deb.sh arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: build/*.deb
+          if-no-files-found: error

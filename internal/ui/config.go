@@ -4,7 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
+
+	"github.com/nexusriot/ducknetview/internal/probe"
 )
 
 // config is the subset of model state persisted between runs. It is loaded in
@@ -15,6 +19,14 @@ type config struct {
 	ConnsRevDNS bool `json:"conns_rev_dns"`
 	ConnsGroup  bool `json:"conns_group"`
 	ShowTotals  bool `json:"show_totals"`
+	AggProcs    bool `json:"aggregate_processes"`
+	// Column keys to leave out of the tables, and whether rates are worded in
+	// bits per second. Both hand-editable.
+	HiddenColumns []string `json:"hidden_columns,omitempty"`
+	RatesInBits   bool     `json:"rates_in_bits,omitempty"`
+	// Extra latency probe targets ("host:port"). The default gateway is always
+	// probed; anything here is additional and may leave the LAN, so it is opt-in.
+	LatencyTargets []string `json:"latency_targets,omitempty"`
 	// Quick filters and the tab that was open, so a restart resumes where the
 	// last session left off.
 	ProtoFilter     int  `json:"proto_filter"`
@@ -42,6 +54,13 @@ type config struct {
 	// Hand-edited: the right number is entirely site-specific.
 	AlertProcessBps float64 `json:"alert_process_bps,omitempty"`
 	AlertConnBps    float64 `json:"alert_connection_bps,omitempty"`
+	// Quality rules, all opt-in: round-trip time (ms), retransmits per minute
+	// on one socket, consecutive polls of connection growth before calling it a
+	// leak, and new remote hosts per poll per process before calling it fan-out.
+	AlertRTTMs         float64 `json:"alert_rtt_ms,omitempty"`
+	AlertRetransPerMin float64 `json:"alert_retrans_per_min,omitempty"`
+	AlertConnGrowth    int     `json:"alert_conn_growth_polls,omitempty"`
+	AlertFanoutHosts   int     `json:"alert_fanout_hosts,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -82,6 +101,18 @@ func (m *Model) applyConfig() {
 	m.connsRevDNS = c.ConnsRevDNS
 	m.connsGroup = c.ConnsGroup
 	m.showTotals = c.ShowTotals
+	m.aggregateProcs = c.AggProcs
+	if len(c.HiddenColumns) > 0 {
+		hidden := make(map[string]bool, len(c.HiddenColumns))
+		for _, key := range c.HiddenColumns {
+			hidden[strings.ToLower(strings.TrimSpace(key))] = true
+		}
+		m.hiddenCols = hidden
+	}
+	if c.RatesInBits {
+		m.rateUnit = probe.UnitBits
+	}
+	m.latencyExtra = c.LatencyTargets
 	m.protoFilter = clampInt(c.ProtoFilter, 0, 2)
 	m.ipVerFilter = clampInt(c.IPVerFilter, 0, 2)
 	m.connStateFilter = clampInt(c.ConnStateFilter, 0, 2)
@@ -107,6 +138,12 @@ func (m *Model) applyConfig() {
 
 	m.alertProcBps = maxFloat(0, c.AlertProcessBps)
 	m.alertConnBps = maxFloat(0, c.AlertConnBps)
+	m.alertRules = alertRules{
+		rttMs:         maxFloat(0, c.AlertRTTMs),
+		retransPerMin: maxFloat(0, c.AlertRetransPerMin),
+		connGrowth:    max(0, c.AlertConnGrowth),
+		fanoutHosts:   max(0, c.AlertFanoutHosts),
+	}
 
 	if len(c.Baseline) > 0 {
 		set := make(map[string]bool, len(c.Baseline))
@@ -125,11 +162,14 @@ func (m *Model) applyConfig() {
 // swallowed: a monitoring tool must never fail to quit because of config I/O).
 func (m Model) saveConfig() {
 	c := config{
-		HideNoise:   m.hideNoise,
-		RefreshMs:   int(m.refreshInterval / time.Millisecond),
-		ConnsRevDNS: m.connsRevDNS,
-		ConnsGroup:  m.connsGroup,
-		ShowTotals:  m.showTotals,
+		HideNoise:      m.hideNoise,
+		RefreshMs:      int(m.refreshInterval / time.Millisecond),
+		ConnsRevDNS:    m.connsRevDNS,
+		ConnsGroup:     m.connsGroup,
+		ShowTotals:     m.showTotals,
+		AggProcs:       m.aggregateProcs,
+		RatesInBits:    m.rateUnit == probe.UnitBits,
+		LatencyTargets: m.latencyExtra,
 
 		ProtoFilter:     m.protoFilter,
 		IPVerFilter:     m.ipVerFilter,
@@ -151,9 +191,20 @@ func (m Model) saveConfig() {
 
 		AlertProcessBps: m.alertProcBps,
 		AlertConnBps:    m.alertConnBps,
+
+		AlertRTTMs:         m.alertRules.rttMs,
+		AlertRetransPerMin: m.alertRules.retransPerMin,
+		AlertConnGrowth:    m.alertRules.connGrowth,
+		AlertFanoutHosts:   m.alertRules.fanoutHosts,
 	}
 	if !m.baselineAt.IsZero() {
 		c.BaselineAt = m.baselineAt.Format(time.RFC3339)
+	}
+	if len(m.hiddenCols) > 0 {
+		for key := range m.hiddenCols {
+			c.HiddenColumns = append(c.HiddenColumns, key)
+		}
+		sort.Strings(c.HiddenColumns)
 	}
 	p, err := configPath()
 	if err != nil {

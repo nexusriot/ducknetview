@@ -149,3 +149,147 @@ func (m Model) WithAlertHook(path string) Model {
 	m.alertHook = path
 	return m
 }
+
+// alertRules is the set of thresholds beyond throughput. Every one of these
+// reads data the probe layer already collects — the point is that a monitor
+// should notice them without the user staring at a table.
+type alertRules struct {
+	rttMs         float64 // round-trip time above this is worth saying
+	retransPerMin float64 // retransmits per minute on one socket
+	connGrowth    int     // consecutive polls of growth before calling it a leak
+	fanoutHosts   int     // distinct new remotes for one process in one poll
+}
+
+func (r alertRules) any() bool {
+	return r.rttMs > 0 || r.retransPerMin > 0 || r.connGrowth > 0 || r.fanoutHosts > 0
+}
+
+// noteQualityAlerts applies the non-throughput rules. It runs after the rate
+// bookkeeping, so the retransmit deltas line up with the same interval.
+func (m *Model) noteQualityAlerts(conns []probe.Conn, now time.Time) {
+	if !m.alertRules.any() {
+		return
+	}
+	if m.alertFired == nil {
+		m.alertFired = map[string]time.Time{}
+	}
+
+	rec := m.newEventRecorder(now)
+	defer rec.flush()
+
+	dt := now.Sub(m.lastQualitySample).Seconds()
+	haveBaseline := !m.lastQualitySample.IsZero() && dt > 0
+	curRetrans := make(map[string]uint32, len(conns))
+
+	// Distinct remotes reached by each process in this poll, for fan-out.
+	fanout := map[int32]map[string]bool{}
+	connCounts := map[int32]int{}
+
+	for _, c := range conns {
+		key := connKey(c)
+		curRetrans[key] = c.Retrans
+		if c.PID > 0 {
+			connCounts[c.PID]++
+		}
+
+		if m.alertRules.rttMs > 0 && c.RTT > 0 {
+			if ms := float64(c.RTT) / float64(time.Millisecond); ms >= m.alertRules.rttMs {
+				subject := c.Local + " → " + m.dnsDisplay(c.Remote)
+				if m.shouldFire("rtt:"+subject, now) {
+					rec.add(levelWarn, "latency", subject,
+						joinNonEmpty(fmt.Sprintf("RTT %s over threshold %.0fms", c.RTT.Round(time.Millisecond), m.alertRules.rttMs),
+							procLabel(c.PID, c.Process)))
+				}
+			}
+		}
+
+		if m.alertRules.retransPerMin > 0 && haveBaseline {
+			if prev, ok := m.prevRetrans[key]; ok {
+				if delta := float64(deltaBytes(uint64(c.Retrans), uint64(prev))); delta > 0 {
+					perMin := delta / dt * 60
+					if perMin >= m.alertRules.retransPerMin {
+						subject := c.Local + " → " + m.dnsDisplay(c.Remote)
+						if m.shouldFire("retrans:"+subject, now) {
+							rec.add(levelWarn, "packet_loss", subject,
+								joinNonEmpty(fmt.Sprintf("%.0f retransmits/min over threshold %.0f", perMin, m.alertRules.retransPerMin),
+									procLabel(c.PID, c.Process)))
+						}
+					}
+				}
+			}
+		}
+
+		if m.alertRules.fanoutHosts > 0 && c.PID > 0 && m.newConns[connKey(c)] {
+			if fanout[c.PID] == nil {
+				fanout[c.PID] = map[string]bool{}
+			}
+			fanout[c.PID][stripPort(c.Remote)] = true
+		}
+	}
+
+	// Fan-out: one process reaching many new hosts at once is what a scan (or a
+	// crawler, or a peer-to-peer client) looks like from the inside.
+	for pid, hosts := range fanout {
+		if len(hosts) < m.alertRules.fanoutHosts {
+			continue
+		}
+		subject := procLabel(pid, m.procNameFor(pid))
+		if m.shouldFire("fanout:"+subject, now) {
+			rec.add(levelAlert, "fanout", subject,
+				fmt.Sprintf("%d new remote hosts in one poll, threshold %d", len(hosts), m.alertRules.fanoutHosts))
+		}
+	}
+
+	// Connection leak: a count that only ever goes up. One poll of growth is
+	// normal; a dozen in a row is a process that never closes anything.
+	if m.alertRules.connGrowth > 0 {
+		if m.connGrowth == nil {
+			m.connGrowth = map[int32]int{}
+		}
+		for pid, count := range connCounts {
+			prev, seen := m.prevConnCounts[pid]
+			switch {
+			case seen && count > prev:
+				m.connGrowth[pid]++
+			case seen && count < prev:
+				m.connGrowth[pid] = 0
+			}
+			if m.connGrowth[pid] >= m.alertRules.connGrowth {
+				subject := procLabel(pid, m.procNameFor(pid))
+				if m.shouldFire("leak:"+subject, now) {
+					rec.add(levelWarn, "conn_growth", subject,
+						fmt.Sprintf("connections grew for %d consecutive polls, now %d — possible leak",
+							m.connGrowth[pid], count))
+				}
+				m.connGrowth[pid] = 0
+			}
+		}
+		// Forget processes that are gone, so the map cannot grow forever.
+		for pid := range m.connGrowth {
+			if _, ok := connCounts[pid]; !ok {
+				delete(m.connGrowth, pid)
+			}
+		}
+	}
+
+	m.prevRetrans = curRetrans
+	m.prevConnCounts = connCounts
+	m.lastQualitySample = now
+	// The throughput path prunes too, but it returns early when no throughput
+	// threshold is set — a host with only quality rules would never prune.
+	m.pruneAlertHistory(now)
+}
+
+// procNameFor is the best name known for a PID, from this poll's process list
+// or the session totals if the process has since gone.
+func (m Model) procNameFor(pid int32) string {
+	for _, p := range m.procs {
+		if p.PID == pid {
+			return p.Name
+		}
+	}
+	if t := m.procTotals[pid]; t != nil {
+		return t.label
+	}
+	return ""
+}

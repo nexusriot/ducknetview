@@ -201,8 +201,8 @@ func TestEventsTabRendersAndClears(t *testing.T) {
 	if !strings.Contains(text, "listener_up") || !strings.Contains(text, "4444") {
 		t.Fatalf("event row missing from the table:\n%s", text)
 	}
-	if !strings.Contains(eventsTabLabel(m.events), "!1") {
-		t.Errorf("tab label = %q, want an alert count", eventsTabLabel(m.events))
+	if !strings.Contains(eventsTabLabel(m.unreadAlerts()), "!1") {
+		t.Errorf("tab label = %q, want an alert count", eventsTabLabel(m.unreadAlerts()))
 	}
 
 	model, _ := m.Update(key("c"))

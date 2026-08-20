@@ -30,6 +30,19 @@ else
 fi
 
 mv ducknetview $bin_dir
+
+# Ship the man page and shell completions alongside the binary.
+man_dir="$folder_name/usr/share/man/man1"
+mkdir -p "$man_dir"
+gzip -9 -c man/ducknetview.1 > "$man_dir/ducknetview.1.gz"
+
+bash_dir="$folder_name/usr/share/bash-completion/completions"
+mkdir -p "$bash_dir"
+cp completions/ducknetview.bash "$bash_dir/ducknetview"
+
+zsh_dir="$folder_name/usr/share/zsh/vendor-completions"
+mkdir -p "$zsh_dir"
+cp completions/_ducknetview "$zsh_dir/_ducknetview"
 sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control
 sed -i "s/Architecture: .*/Architecture: $arch/" $folder_name/DEBIAN/control
 

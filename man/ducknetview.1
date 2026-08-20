@@ -1,0 +1,162 @@
+.TH DUCKNETVIEW 1 "2026-08" "ducknetview" "User Commands"
+.SH NAME
+ducknetview \- terminal network monitor
+.SH SYNOPSIS
+.B ducknetview
+.RI [ options ]
+.SH DESCRIPTION
+.B ducknetview
+is a terminal user interface for watching a host's network: interfaces and their
+throughput, listening sockets, processes, active and recently closed
+connections, a log of what changed, and the host's routing configuration.
+.PP
+On Linux, per-connection throughput, round-trip time and retransmit counts are
+read from the kernel's
+.B sock_diag
+netlink interface \(em the same source
+.BR ss (8)
+uses. No elevated privileges are required. On other platforms those columns are
+hidden rather than shown empty.
+.SH OPTIONS
+.TP
+.B \-\-once
+Print a one-shot text snapshot and exit.
+.TP
+.B \-\-json
+Print a fuller snapshot as JSON and exit.
+.TP
+.BI \-\-from " file"
+Browse a
+.B \-\-json
+snapshot instead of the live host.
+.B \-
+reads standard input, so
+.RB ` "ssh host ducknetview --json | ducknetview --from -" '
+browses a remote host.
+.TP
+.B \-\-metrics
+Print the host's network state in Prometheus text format and exit, for a
+node_exporter textfile directory.
+.TP
+.BI \-\-top " n"
+Print the
+.I n
+busiest processes and hosts and exit.
+.TP
+.BI \-\-usage " days"
+Print the recorded daily usage for the last
+.I days
+days.
+.B \-\-usage\-all
+prints everything recorded.
+.TP
+.B \-\-check\-baseline
+Compare the host's listeners against the saved baseline. Exits
+.B 0
+when clean,
+.B 1
+when unexpected listeners are present, and
+.B 2
+when no baseline has been saved.
+.TP
+.BI \-\-baseline " file"
+Check against a baseline file rather than the per-user one.
+.TP
+.BI \-\-save\-baseline " file"
+Write the current listeners to a portable baseline file and exit.
+.TP
+.BI \-\-log\-events " file"
+Append events to a file as JSON lines. The file is rotated at 8 MiB, keeping one
+previous generation.
+.TP
+.BI \-\-on\-alert " command"
+Run
+.I command
+for each alert-level event. It receives the event kind, subject and detail as
+arguments, and
+.BR DNV_EVENT_KIND ,
+.BR DNV_EVENT_LEVEL ,
+.BR DNV_EVENT_SUBJECT ,
+.BR DNV_EVENT_DETAIL
+and
+.B DNV_EVENT_AT
+in its environment. It is executed directly, never through a shell.
+.TP
+.BI \-\-tab " name"
+Open on a particular tab: overview, interfaces, ports, processes, connections,
+events or routes.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH KEYS
+.TP
+.B 1\-7
+Jump to a tab.
+.B ?
+shows the full key list, which is authoritative; the bindings below are the ones
+worth knowing first.
+.TP
+.B /
+Search. Prefix the query with
+.B re:
+for a regular expression;
+.B \e
+switches between filtering rows and highlighting them, and
+.BR n / N
+jump between matches.
+.TP
+.B t
+Switch the throughput columns between current rate and session total.
+.B U
+switches between bytes and bits per second.
+.TP
+.B z
+On the Connections tab, show connections that have closed.
+.B g
+groups them by remote host,
+.B i
+filters by interface.
+.TP
+.B b
+Save the current listeners as the expected baseline;
+.B a
+accepts one highlighted listener into it;
+.B B
+clears it.
+.TP
+.B w
+Add the highlighted connection's remote to the watchlist.
+.TP
+.B x
+Signal the highlighted row's process, confirming with
+.BR t / k / h
+for TERM, KILL or HUP.
+.TP
+.B q
+Quit (with a confirmation).
+.B Ctrl\-C
+quits immediately.
+.SH FILES
+.TP
+.I ${XDG_CONFIG_HOME:-~/.config}/ducknetview/config.json
+Settings, the watchlist, the listener baseline and the alert thresholds.
+.TP
+.I ${XDG_CONFIG_HOME:-~/.config}/ducknetview/usage.json
+Recorded daily traffic totals.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+Disable colour entirely.
+.SH EXIT STATUS
+.B 0
+on success,
+.B 1
+when
+.B \-\-check\-baseline
+finds unexpected listeners, and
+.B 2
+for a usage or collection error.
+.SH SEE ALSO
+.BR ss (8),
+.BR ip (8),
+.BR nethogs (8)

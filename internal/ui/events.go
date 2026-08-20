@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -98,10 +99,50 @@ func (m *Model) recordEvent(e event) {
 	if err != nil {
 		return
 	}
-	if _, err := m.eventLog.Write(append(b, '\n')); err != nil && m.eventLogErr == nil {
+	n, err := m.eventLog.Write(append(b, '\n'))
+	if err != nil && m.eventLogErr == nil {
 		m.eventLogErr = err
 		m.status = "Event log write failed: " + err.Error()
+		return
 	}
+	m.eventLogBytes += int64(n)
+	m.rotateEventLog()
+}
+
+// eventLogMaxBytes is when the log is rolled over. A chatty host left running
+// for a week would otherwise append until the disk complained.
+const eventLogMaxBytes = 8 << 20
+
+// rotateEventLog moves the log aside and starts a fresh one once it grows past
+// the cap, keeping exactly one previous generation.
+func (m *Model) rotateEventLog() {
+	limit := m.eventLogMax
+	if limit <= 0 {
+		limit = eventLogMaxBytes
+	}
+	if m.eventLog == nil || m.eventLogBytes < limit {
+		return
+	}
+
+	_ = m.eventLog.Close()
+	m.eventLog = nil
+
+	if err := os.Rename(m.eventLogPath, m.eventLogPath+".1"); err != nil && m.eventLogErr == nil {
+		m.eventLogErr = err
+		m.status = "Event log rotation failed: " + err.Error()
+		return
+	}
+	f, err := os.OpenFile(m.eventLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		if m.eventLogErr == nil {
+			m.eventLogErr = err
+			m.status = "Event log reopen failed: " + err.Error()
+		}
+		return
+	}
+	m.eventLog = f
+	m.eventLogBytes = 0
+	m.status = "Event log rotated to " + m.eventLogPath + ".1"
 }
 
 // eventRecorder batches one poll's events so the per-poll cap can be applied
@@ -148,6 +189,19 @@ func (m *Model) noteSocketEvents(prevPorts map[string]probe.ListenPort, conns []
 	rec := m.newEventRecorder(at)
 	defer rec.flush()
 
+	// Listeners that went away this poll, indexed by the identity a service
+	// keeps when it merely rebinds: protocol, port and process name.
+	gone := map[string][]probe.ListenPort{}
+	if !firstRun {
+		for key, p := range prevPorts {
+			if _, still := m.prevPorts[key]; still || !baselineEligible(p) {
+				continue
+			}
+			id := listenerIdentity(p)
+			gone[id] = append(gone[id], p)
+		}
+	}
+
 	for _, p := range m.ports {
 		key := portKey(p)
 		// Ephemeral UDP sockets churn constantly (every DNS query is one), so
@@ -155,6 +209,27 @@ func (m *Model) noteSocketEvents(prevPorts map[string]probe.ListenPort, conns []
 		if !m.newPorts[key] || !baselineEligible(p) {
 			continue
 		}
+
+		// A listener vanishing and reappearing on the same port under the same
+		// process is one event, not two: postgres moving from 127.0.0.1 to
+		// 0.0.0.0 is the single most important thing this log can tell you, and
+		// as separate up/down lines it reads like noise.
+		if id := listenerIdentity(p); len(gone[id]) > 0 {
+			was := gone[id][0]
+			gone[id] = gone[id][1:]
+
+			before := probe.ListenerExposure(stripPort(was.Local))
+			after := probe.ListenerExposure(stripPort(p.Local))
+			level, verb := levelInfo, "rebound"
+			if exposureRank(after) > exposureRank(before) {
+				level, verb = levelAlert, "now reachable from further away"
+			}
+			rec.add(level, "listener_moved", p.Proto+" "+p.Local,
+				joinNonEmpty(fmt.Sprintf("was %s (%s → %s), %s", was.Local, before, after, verb),
+					procLabel(p.PID, p.Process)))
+			continue
+		}
+
 		level, note := levelWarn, probe.ListenerExposure(stripPort(p.Local))
 		if m.offBaseline(p) {
 			level = levelAlert
@@ -163,11 +238,9 @@ func (m *Model) noteSocketEvents(prevPorts map[string]probe.ListenPort, conns []
 		rec.add(level, "listener_up", p.Proto+" "+p.Local, joinNonEmpty(note, procLabel(p.PID, p.Process)))
 	}
 
-	if !firstRun {
-		for key, p := range prevPorts {
-			if _, still := m.prevPorts[key]; still || !baselineEligible(p) {
-				continue
-			}
+	// Whatever is left really did go away.
+	for _, ps := range gone {
+		for _, p := range ps {
 			rec.add(levelInfo, "listener_down", p.Proto+" "+p.Local, procLabel(p.PID, p.Process))
 		}
 	}
@@ -233,6 +306,27 @@ func (m *Model) noteIfaceEvents(snap probe.NetSnapshot) {
 	m.prevIfaceUp = cur
 }
 
+// listenerIdentity is what stays the same when a service rebinds: the process
+// name rather than the PID, since a restart gets a new one.
+func listenerIdentity(p probe.ListenPort) string {
+	_, port := probe.SplitHostPort(p.Local)
+	return p.Proto + "|" + strconv.Itoa(port) + "|" + p.Process
+}
+
+// exposureRank orders reachability so a move can be judged as widening or
+// narrowing rather than merely different.
+func exposureRank(exposure string) int {
+	switch exposure {
+	case "local":
+		return 0
+	case "lan":
+		return 1
+	case "exposed":
+		return 2
+	}
+	return 0
+}
+
 func upDown(up bool) string {
 	if up {
 		return "up"
@@ -269,19 +363,25 @@ func procLabel(pid int32, name string) string {
 	return fmt.Sprintf("pid %d (%s)", pid, name)
 }
 
-// eventsTabLabel appends an alert count to the tab title so a listener coming
-// up is noticeable from any other tab.
-func eventsTabLabel(events []event) string {
-	alerts := 0
-	for _, e := range events {
-		if e.Level == levelAlert {
-			alerts++
+// unreadAlerts counts alerts raised since they were last acknowledged, so the
+// badge can be cleared with `d` without throwing the log away.
+func (m Model) unreadAlerts() int {
+	n := 0
+	for _, e := range m.events {
+		if e.Level == levelAlert && e.At.After(m.alertsAckedAt) {
+			n++
 		}
 	}
-	if alerts == 0 {
+	return n
+}
+
+// eventsTabLabel appends the unread alert count to the tab title so a listener
+// coming up is noticeable from any other tab.
+func eventsTabLabel(unread int) string {
+	if unread == 0 {
 		return "6 Events"
 	}
-	return fmt.Sprintf("6 Events !%d", alerts)
+	return fmt.Sprintf("6 Events !%d", unread)
 }
 
 // eventLevelFilter values: 0 everything, 1 warn and above, 2 alerts only.
@@ -347,7 +447,7 @@ func (m Model) renderEventsText() string {
 	colDetail := max(10, rest-colSubject-2)
 
 	b.WriteString("Events (newest first)\n")
-	sub := "↑↓ select • / search • l level: " + m.eventLevelLabel() + " • y copy • e export • c clear"
+	sub := "↑↓ select • / search • l level: " + m.eventLevelLabel() + " • d ack • y copy • e export • c clear"
 	if m.eventLog != nil {
 		sub += " • logging to " + m.eventLogPath
 	}
@@ -392,15 +492,10 @@ func (m Model) viewEvents() string {
 		m.eventsVP.SetContent(m.eventsText)
 	}
 
-	alerts := 0
-	for _, e := range m.events {
-		if e.Level == levelAlert {
-			alerts++
-		}
-	}
+	alerts := m.unreadAlerts()
 	head := subtleStyle.Render(fmt.Sprintf("%d %s", len(m.events), plural(len(m.events), "event")))
 	if alerts > 0 {
-		head += " " + errStyle.Render(fmt.Sprintf("(%d %s)", alerts, plural(alerts, "alert")))
+		head += " " + errStyle.Render(fmt.Sprintf("(%d unread %s)", alerts, plural(alerts, "alert")))
 	}
 	switch {
 	case m.eventsSearching:
@@ -422,5 +517,10 @@ func (m Model) OpenEventLog(path string) (Model, error) {
 	}
 	m.eventLog = f
 	m.eventLogPath = path
+	// Count what is already there, so an existing log is rotated on its real
+	// size rather than only on what this session appends.
+	if info, err := f.Stat(); err == nil {
+		m.eventLogBytes = info.Size()
+	}
 	return m, nil
 }

@@ -10,7 +10,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	_ "github.com/gdamore/tcell/v2" // keep tcell in the build; Bubble Tea already owns the terminal
+	"github.com/muesli/termenv"
 
 	"github.com/nexusriot/ducknetview/internal/probe"
 	"github.com/nexusriot/ducknetview/internal/ui"
@@ -34,6 +36,11 @@ func main() {
 	logEvents := flag.String("log-events", "", "append events (new listeners, watchlist hits, interface changes) to a file as JSON lines")
 	onAlert := flag.String("on-alert", "", "command to run for each alert-level event (receives kind, subject and detail as arguments)")
 	startTab := flag.String("tab", "", "tab to open on start: "+strings.Join(ui.TabNames(), ", "))
+	fromFile := flag.String("from", "", "browse a --json snapshot instead of the live host (\"-\" reads stdin)")
+	metrics := flag.Bool("metrics", false, "print the host's network state in Prometheus text format and exit")
+	top := flag.Int("top", 0, "print the N busiest processes and hosts and exit")
+	usage := flag.Int("usage", 0, "print the recorded daily usage for the last N days and exit (see -usage-all)")
+	showUsage := flag.Bool("usage-all", false, "print all recorded daily usage and exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -44,6 +51,29 @@ func main() {
 
 	if *saveBaseline != "" {
 		os.Exit(runSaveBaseline(*saveBaseline))
+	}
+
+	if *metrics {
+		if err := runMetrics(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *top > 0 {
+		if err := runTop(*top); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *usage > 0 || *showUsage {
+		days := *usage
+		if *showUsage {
+			days = 0
+		}
+		fmt.Print(ui.FormatUsage(days))
+		return
 	}
 
 	if *checkBaseline {
@@ -57,7 +87,20 @@ func main() {
 		return
 	}
 
+	// NO_COLOR is a convention worth honouring explicitly rather than hoping the
+	// renderer notices it (https://no-color.org).
+	if os.Getenv("NO_COLOR") != "" {
+		lipgloss.SetColorProfile(termenv.Ascii)
+	}
+
 	m := ui.NewModel().WithConfig()
+	if *fromFile != "" {
+		snap, err := ui.LoadSnapshot(*fromFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		m = m.WithSnapshot(snap)
+	}
 	if *logEvents != "" {
 		var err error
 		if m, err = m.OpenEventLog(*logEvents); err != nil {
@@ -135,7 +178,7 @@ func runBaselineCheck(file string) int {
 	}
 
 	if len(offending) == 0 {
-		fmt.Printf("baseline clean: %d listeners, none unexpected", len(info.Ports))
+		fmt.Printf("baseline clean: %d listeners compared, none unexpected", ui.BaselineComparable(info.Ports))
 		if !savedAt.IsZero() {
 			fmt.Printf(" (baseline saved %s)", savedAt.Format("2006-01-02 15:04:05"))
 		}
@@ -151,6 +194,55 @@ func runBaselineCheck(file string) int {
 			probe.ListenerExposure(host), p.PID, p.Process)
 	}
 	return exitOffending
+}
+
+// sampleTwice takes two socket enumerations a second apart, which is what any
+// rate has to be derived from.
+func sampleTwice() (probe.ConnInfo, probe.ConnInfo, float64, error) {
+	first, err := probe.Collect(0)
+	if err != nil {
+		return probe.ConnInfo{}, probe.ConnInfo{}, 0, err
+	}
+	start := time.Now()
+	time.Sleep(time.Second)
+	second, err := probe.Collect(0)
+	if err != nil {
+		return probe.ConnInfo{}, probe.ConnInfo{}, 0, err
+	}
+	return first, second, time.Since(start).Seconds(), nil
+}
+
+// runMetrics prints one scrape's worth of metrics. Rates need two samples, so
+// this takes a second to run — which is fine for a cron-driven textfile.
+func runMetrics() error {
+	s := probe.NewNetSampler()
+	if _, err := s.Sample(); err != nil { // prime the interface counters
+		return err
+	}
+	time.Sleep(time.Second)
+	snap, err := s.Sample()
+	if err != nil {
+		return err
+	}
+	info, err := probe.Collect(0)
+	if err != nil {
+		return err
+	}
+
+	offending, _, known := ui.BaselineCheck(info.Ports)
+	fmt.Print(ui.FormatMetrics(snap, info, len(offending), known))
+	return nil
+}
+
+// runTop prints the busiest processes and hosts, for a quick answer without the
+// TUI.
+func runTop(n int) error {
+	first, second, seconds, err := sampleTwice()
+	if err != nil {
+		return err
+	}
+	fmt.Print(ui.FormatTopTalkers(first, second, seconds, n))
+	return nil
 }
 
 // runSnapshot samples the system once and prints it to stdout, for scripting /

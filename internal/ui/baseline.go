@@ -15,18 +15,10 @@ import (
 // restarts — the per-poll "new listener" highlight only catches a listener
 // that appears while you happen to be watching.
 
-// baselineEligible reports whether a listener is stable enough to be worth
-// baselining. UDP has no LISTEN state, so every outbound DNS query looks like a
-// new "listener" on a random high port; baselining those would mean a
-// permanently dirty baseline. They stay visible in the Ports table — they are
-// just not treated as part of the host's expected service surface.
-func baselineEligible(p probe.ListenPort) bool {
-	if p.Proto != "udp" {
-		return true
-	}
-	_, port := probe.SplitHostPort(p.Local)
-	return !probe.IsEphemeralPort(port)
-}
+// baselineEligible reports whether a listener belongs in the host's expected
+// service surface. Ephemeral UDP client sockets do not: baselining those would
+// mean a permanently dirty baseline. They stay visible in the Ports table.
+func baselineEligible(p probe.ListenPort) bool { return probe.IsServiceListener(p) }
 
 // setBaseline records the current listener set as the expected one and
 // persists it.
@@ -177,4 +169,54 @@ func BaselineCheckFile(path string, ports []probe.ListenPort) (offending []probe
 		savedAt = t
 	}
 	return compareBaseline(bf.Listeners, ports), savedAt, nil
+}
+
+// acceptListener folds a single listener into the baseline, or drops it again
+// if it is already there. Re-saving the whole baseline to bless one new service
+// would also bless anything else that appeared since, which is the opposite of
+// what a baseline is for.
+func (m *Model) acceptListener(p probe.ListenPort) (string, bool) {
+	if !m.hasBaseline() {
+		return "No baseline saved — press b to record one first", false
+	}
+	if !baselineEligible(p) {
+		return "Ephemeral UDP sockets are not part of the baseline", false
+	}
+
+	key := portKey(p)
+	if m.baseline[key] {
+		delete(m.baseline, key)
+		m.baselineRaw = removeString(m.baselineRaw, key)
+		m.saveConfig()
+		return "Removed " + p.Proto + " " + p.Local + " from the baseline", true
+	}
+
+	m.baseline[key] = true
+	m.baselineRaw = append(m.baselineRaw, key)
+	sort.Strings(m.baselineRaw)
+	m.saveConfig()
+	return "Accepted " + p.Proto + " " + p.Local + " into the baseline", true
+}
+
+// removeString returns the slice without the first occurrence of s.
+func removeString(list []string, s string) []string {
+	for i, v := range list {
+		if v == s {
+			return append(list[:i:i], list[i+1:]...)
+		}
+	}
+	return list
+}
+
+// BaselineComparable counts the listeners a baseline check actually looks at,
+// so the "all clear" message does not quote a total that includes the ephemeral
+// UDP sockets it deliberately ignores.
+func BaselineComparable(ports []probe.ListenPort) int {
+	n := 0
+	for _, p := range ports {
+		if baselineEligible(p) {
+			n++
+		}
+	}
+	return n
 }

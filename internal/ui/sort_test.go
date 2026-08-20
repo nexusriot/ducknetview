@@ -15,7 +15,7 @@ func sortIndex(cols []string, name string) int {
 	return -1
 }
 
-func procNames(ps []probe.ProcNet) []string {
+func procNames(ps []procRow) []string {
 	out := make([]string, len(ps))
 	for i, p := range ps {
 		out[i] = p.Name

@@ -22,6 +22,10 @@ type closedConn struct {
 	firstSeen time.Time
 	closedAt  time.Time
 	totals    byteTotals
+	// The interface the socket used, captured while it still existed: the live
+	// attribution map only covers current connections, so without this the
+	// interface filter could never match a closed row.
+	iface string
 }
 
 // lifetime is how long the connection existed, as far as this session saw it.
@@ -65,6 +69,7 @@ func (m *Model) noteClosedConns(conns []probe.Conn, now time.Time) {
 			firstSeen: m.connFirstSeen[key],
 			closedAt:  now,
 			totals:    byteTotals{rx: c.RxBytes, tx: c.TxBytes},
+			iface:     m.connIface[key],
 		})
 	}
 	if len(closed) == 0 {
@@ -87,6 +92,9 @@ func (m Model) closedRows() []closedConn {
 		cc := m.closedConns[i]
 		c := cc.conn
 		if !m.passProtoFilter(c.Proto) || !m.passIPVerFilter(c.Remote) || !m.passUserFilter(c.User) {
+			continue
+		}
+		if m.ifaceFilter != "" && cc.iface != m.ifaceFilter {
 			continue
 		}
 		if m.publicOnly && probe.IPScope(stripPort(c.Remote)) != "public" {
@@ -169,7 +177,7 @@ func (m Model) closedColumns() colSpecs {
 		colProc = 8
 	}
 
-	return colSpecs{
+	return m.visible(colSpecs{
 		{key: "proto", title: "PR", width: colProto},
 		{key: "local", title: "LOCAL", width: colLocal},
 		{key: "remote", title: "REMOTE", width: colRemote, sort: "remote"},
@@ -180,7 +188,7 @@ func (m Model) closedColumns() colSpecs {
 		{key: "tx", title: "TX∑", width: colBytes, sort: "bytes"},
 		{key: "pid", title: "PID", width: colPID},
 		{key: "process", title: "PROCESS", width: colProc, sort: "process"},
-	}
+	})
 }
 
 func (m Model) renderConnsClosed() string {
@@ -243,17 +251,18 @@ func (m Model) renderConnsClosed() string {
 
 		rx, tx := totalCells(cc.totals, colBytes)
 
-		b.WriteString(gutter(i == m.connsCursor) + fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s  %s  %s  %s\n",
-			padRight(trunc(c.Proto, colProto), colProto),
-			q.highlight(padRight(trunc(c.Local, colLocal), colLocal)),
-			remote,
-			q.highlight(padRight(trunc(probe.ServiceName(portOf(c.Remote), c.Proto), colSvc), colSvc)),
-			padRight(trunc(cc.lifetimeLabel(), colLife), colLife),
-			padRight(trunc(formatAge(now, cc.closedAt), colClosed), colClosed),
-			rx, tx,
-			padRight(fmt.Sprintf("%d", c.PID), colPID),
-			q.highlight(trunc(proc, colProc)),
-		))
+		b.WriteString(gutter(i == m.connsCursor) + cols.row(map[string]string{
+			"proto":   padRight(trunc(c.Proto, colProto), colProto),
+			"local":   q.highlight(padRight(trunc(c.Local, colLocal), colLocal)),
+			"remote":  remote,
+			"svc":     q.highlight(padRight(trunc(probe.ServiceName(portOf(c.Remote), c.Proto), colSvc), colSvc)),
+			"life":    padRight(trunc(cc.lifetimeLabel(), colLife), colLife),
+			"closed":  padRight(trunc(formatAge(now, cc.closedAt), colClosed), colClosed),
+			"rx":      rx,
+			"tx":      tx,
+			"pid":     padRight(fmt.Sprintf("%d", c.PID), colPID),
+			"process": q.highlight(trunc(proc, colProc)),
+		}) + "\n")
 	}
 
 	return b.String()

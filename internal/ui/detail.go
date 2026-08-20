@@ -25,7 +25,9 @@ func (m Model) selectedPID() (int32, string, bool) {
 	case tabProcs:
 		rows := m.filteredProcs()
 		if m.procsCursor >= 0 && m.procsCursor < len(rows) {
-			if p := rows[m.procsCursor]; p.PID > 0 {
+			// A folded group stands for many processes; signalling "the group"
+			// would be a guess about which one the user meant.
+			if p := rows[m.procsCursor]; p.PID > 0 && p.members <= 1 {
 				return p.PID, p.Name, true
 			}
 		}
@@ -43,6 +45,20 @@ func (m Model) selectedPID() (int32, string, bool) {
 		}
 	}
 	return 0, "", false
+}
+
+// formatPIDs lists a group's PIDs compactly, cut off before it fills the line.
+func formatPIDs(pids []int32) string {
+	const show = 6
+	parts := make([]string, 0, show+1)
+	for i, pid := range pids {
+		if i == show {
+			parts = append(parts, fmt.Sprintf("+%d more", len(pids)-show))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%d", pid))
+	}
+	return strings.Join(parts, " ")
 }
 
 // timeOrDash formats a timestamp that may not have been recorded.
@@ -95,25 +111,33 @@ func (m Model) detailContent() (string, bool) {
 			return "", false
 		}
 		p := rows[m.procsCursor]
-		b.WriteString(titleStyle.Render("Process") + "\n\n")
-		kv("PID", fmt.Sprintf("%d", p.PID))
-		kv("Name", p.Name)
+		if p.members > 1 {
+			b.WriteString(titleStyle.Render("Process group") + "\n\n")
+			kv("Name", p.Name)
+			kv("Processes", fmt.Sprintf("%d (%s)", p.members, formatPIDs(p.pids)))
+		} else {
+			b.WriteString(titleStyle.Render("Process") + "\n\n")
+			kv("PID", fmt.Sprintf("%d", p.PID))
+			kv("Name", p.Name)
+		}
 		kv("User", p.User)
 		kv("Container", p.Container)
 		kv("CPU %", fmt.Sprintf("%.1f", p.CPU))
 		kv("Mem %", fmt.Sprintf("%.1f", p.Mem))
 		if m.hasThroughput {
-			r := m.procRate(p.PID)
-			t := m.procTotal(p.PID)
-			kv("RX", probe.HumanBytesPerSec(r.rx)+"   session "+probe.HumanBytes(t.rx))
-			kv("TX", probe.HumanBytesPerSec(r.tx)+"   session "+probe.HumanBytes(t.tx))
-			writeRateSparks(&b, m.procRateHist[p.PID], m.detailWidth())
+			r := m.rowRate(p)
+			t := m.rowTotal(p)
+			kv("RX", m.rate(r.rx)+"   session "+probe.HumanBytes(t.rx))
+			kv("TX", m.rate(r.tx)+"   session "+probe.HumanBytes(t.tx))
+			writeRateSparks(&b, m.rowHistory(p), m.detailWidth())
 		}
 		kv("Conns", fmt.Sprintf("%d", p.ConnCount))
 		kv("Listening", fmt.Sprintf("%d", p.ListenCount))
-		if d, err := probe.ProcessDetail(p.PID); err == nil {
-			kv("PPID", fmt.Sprintf("%d", d.Ppid))
-			kv("Command", d.Cmdline)
+		if p.members <= 1 {
+			if d, err := probe.ProcessDetail(p.PID); err == nil {
+				kv("PPID", fmt.Sprintf("%d", d.Ppid))
+				kv("Command", d.Cmdline)
+			}
 		}
 
 	case tabConns:
@@ -165,8 +189,8 @@ func (m Model) detailContent() (string, bool) {
 			if m.hasThroughput {
 				r := m.groupRate(g)
 				t := m.hostTotal(g.ip)
-				kv("RX", probe.HumanBytesPerSec(r.rx)+"   session "+probe.HumanBytes(t.rx))
-				kv("TX", probe.HumanBytesPerSec(r.tx)+"   session "+probe.HumanBytes(t.tx))
+				kv("RX", m.rate(r.rx)+"   session "+probe.HumanBytes(t.rx))
+				kv("TX", m.rate(r.tx)+"   session "+probe.HumanBytes(t.tx))
 			}
 		} else {
 			rows := m.filteredConns()
@@ -187,8 +211,8 @@ func (m Model) detailContent() (string, bool) {
 			kv("Age", formatAge(time.Now(), m.connFirstSeen[connKey(c)]))
 			if m.hasThroughput {
 				r := m.connRate(c)
-				kv("RX", probe.HumanBytesPerSec(r.rx)+"  (total "+probe.HumanBytes(c.RxBytes)+")")
-				kv("TX", probe.HumanBytesPerSec(r.tx)+"  (total "+probe.HumanBytes(c.TxBytes)+")")
+				kv("RX", m.rate(r.rx)+"  (total "+probe.HumanBytes(c.RxBytes)+")")
+				kv("TX", m.rate(r.tx)+"  (total "+probe.HumanBytes(c.TxBytes)+")")
 				if c.RTT > 0 {
 					rtt := c.RTT.Round(time.Millisecond / 10).String()
 					if c.MinRTT > 0 {
@@ -314,5 +338,19 @@ func (m Model) renderKillConfirm() string {
 		sigKey("k", "SIGKILL") + "   " +
 		sigKey("h", "SIGHUP") + "   " +
 		sigKey("n/esc", "cancel"))
+	return boxStyle.Width(min(m.w-2, 80)).Height(m.bodyHeight()).Render(b.String())
+}
+
+func (m Model) renderQuitConfirm() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Quit ducknetview?") + "\n\n")
+	if m.sessionTotal.any() {
+		// Worth saying: the session totals and the event log do not survive.
+		b.WriteString(subtleStyle.Render(fmt.Sprintf(
+			"  This session accounted %s in and %s out, and %d events.\n\n",
+			probe.HumanBytes(m.sessionTotal.rx), probe.HumanBytes(m.sessionTotal.tx), len(m.events))))
+	}
+	b.WriteString("  " + okStyle.Render("y") + subtleStyle.Render(" quit") + "   " +
+		okStyle.Render("any other key") + subtleStyle.Render(" stay"))
 	return boxStyle.Width(min(m.w-2, 80)).Height(m.bodyHeight()).Render(b.String())
 }

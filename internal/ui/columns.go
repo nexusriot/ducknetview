@@ -148,3 +148,40 @@ func mouseHeaderKey(cols colSpecs, yOffset, x, y int) (string, bool) {
 	}
 	return cols.keyAt(x - tableContentX)
 }
+
+// row joins one row's cells in column order, skipping any column the layout
+// does not include. Cells arrive already padded and styled; a column that is
+// hidden simply has no cell rendered for it, which is what makes hiding a
+// column a layout decision rather than a change to every renderer.
+func (cs colSpecs) row(cells map[string]string) string {
+	var b strings.Builder
+	for i, c := range cs {
+		if i > 0 {
+			b.WriteString(colSep)
+		}
+		b.WriteString(cells[c.key])
+	}
+	return b.String()
+}
+
+// visible drops the columns the user has hidden in the config. Sortable columns
+// that disappear stay sortable through `s` — hiding a column is about screen
+// width, not about taking the data away.
+func (m Model) visible(cols colSpecs) colSpecs {
+	if len(m.hiddenCols) == 0 {
+		return cols
+	}
+	out := make(colSpecs, 0, len(cols))
+	for _, c := range cols {
+		if m.hiddenCols[c.key] {
+			continue
+		}
+		out = append(out, c)
+	}
+	// Never hide everything: an empty table would look like a bug rather than a
+	// configuration choice.
+	if len(out) == 0 {
+		return cols
+	}
+	return out
+}

@@ -40,11 +40,11 @@ func exportViewCmd(m Model) tea.Cmd {
 		}
 	case tabProcs:
 		name = "processes"
-		header = []string{"pid", "name", "user", "container", "cpu_percent", "mem_percent", "rx_bps", "tx_bps", "conns", "listen"}
+		header = []string{"pid", "processes", "name", "user", "container", "cpu_percent", "mem_percent", "rx_bps", "tx_bps", "conns", "listen"}
 		for _, p := range m.filteredProcs() {
-			r := m.procRate(p.PID)
+			r := m.rowRate(p)
 			records = append(records, []string{
-				strconv.Itoa(int(p.PID)), p.Name, p.User, p.Container,
+				strconv.Itoa(int(p.PID)), strconv.Itoa(p.members), p.Name, p.User, p.Container,
 				strconv.FormatFloat(p.CPU, 'f', 1, 64),
 				strconv.FormatFloat(float64(p.Mem), 'f', 1, 32),
 				strconv.FormatFloat(r.rx, 'f', 0, 64), strconv.FormatFloat(r.tx, 'f', 0, 64),

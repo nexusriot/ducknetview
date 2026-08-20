@@ -246,13 +246,47 @@ func (m Model) trafficCells(rate rateSample, total byteTotals, width int) (strin
 	if m.showTotals {
 		return totalCells(total, width)
 	}
-	return rateCells(rate, width)
+	return m.rateCells(rate, width)
 }
 
-// trafficHeaders labels those columns for the active mode.
+// trafficHeaders labels those columns for the active mode and unit, so the
+// numbers underneath are never ambiguous.
 func (m Model) trafficHeaders() (string, string) {
 	if m.showTotals {
 		return "RX∑", "TX∑"
 	}
+	if m.rateUnit == probe.UnitBits {
+		return "RXb", "TXb"
+	}
 	return "RX", "TX"
 }
+
+// rate formats a throughput figure in the active unit.
+func (m Model) rate(bps float64) string {
+	return probe.FormatRate(bps, m.rateUnit)
+}
+
+// renderChurn draws how many connections opened and closed per poll. A spike is
+// how a connection leak or a scan announces itself long before the tables look
+// unusual.
+func (m Model) renderChurn(width int) string {
+	if len(m.churnUpHist) < 2 {
+		return ""
+	}
+	if maxOf(m.churnUpHist) == 0 && maxOf(m.churnDownHist) == 0 {
+		return "" // nothing has opened or closed yet
+	}
+
+	chartW := max(10, min(width-24, 60))
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Connection churn") + "  " +
+		subtleStyle.Render(fmt.Sprintf("per poll, peak +%.0f/-%.0f",
+			maxOf(m.churnUpHist), maxOf(m.churnDownHist))) + "\n")
+	b.WriteString(fmt.Sprintf("opened  %-5.0f %s\n", lastOr0(m.churnUpHist), Spark(m.churnUpHist, chartW)))
+	b.WriteString(fmt.Sprintf("closed  %-5.0f %s\n\n", lastOr0(m.churnDownHist), Spark(m.churnDownHist, chartW)))
+	return b.String()
+}
+
+// rateUnitIsBits reports whether throughput is currently worded in bits per
+// second.
+func (m Model) rateUnitIsBits() bool { return m.rateUnit == probe.UnitBits }

@@ -1,0 +1,18 @@
+#compdef ducknetview
+# zsh completion for ducknetview
+
+_arguments -s \
+  '--once[print a one-shot text snapshot and exit]' \
+  '--json[print a snapshot as JSON and exit]' \
+  '--from[browse a --json snapshot instead of the live host]:snapshot file:_files' \
+  '--metrics[print Prometheus metrics and exit]' \
+  '--top[print the N busiest processes and hosts]:count:' \
+  '--usage[print recorded daily usage for the last N days]:days:' \
+  '--usage-all[print all recorded daily usage]' \
+  '--check-baseline[exit non-zero if listeners are unexpected]' \
+  '--baseline[baseline file to check against]:baseline file:_files' \
+  '--save-baseline[write a portable baseline file]:baseline file:_files' \
+  '--log-events[append events to a file as JSON lines]:log file:_files' \
+  '--on-alert[run a command for each alert]:command:_command_names -e' \
+  '--tab[tab to open on start]:tab:(overview interfaces ports processes connections events routes)' \
+  '--version[print the version and exit]'

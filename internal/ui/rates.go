@@ -167,9 +167,9 @@ func formatRetrans(n uint32) string {
 
 // rateCells renders a row's RX/TX columns, dimming idle rows so the ones
 // actually moving data stand out.
-func rateCells(r rateSample, width int) (string, string) {
-	rx := padRight(probe.CompactRate(r.rx), width)
-	tx := padRight(probe.CompactRate(r.tx), width)
+func (m Model) rateCells(r rateSample, width int) (string, string) {
+	rx := padRight(probe.CompactRateUnit(r.rx, m.rateUnit), width)
+	tx := padRight(probe.CompactRateUnit(r.tx, m.rateUnit), width)
 	if r.rx <= 0 {
 		rx = subtleStyle.Render(rx)
 	}

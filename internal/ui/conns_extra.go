@@ -70,6 +70,36 @@ func (m *Model) kickConnLookups() []tea.Cmd {
 	return cmds
 }
 
+// dnsCacheMax bounds the reverse-DNS caches. They are keyed by remote IP, so a
+// day of browsing would otherwise add tens of thousands of entries that will
+// never be looked up again.
+const dnsCacheMax = 4096
+
+// pruneDNSCache keeps the caches bounded by discarding entries for addresses
+// that are no longer connected. Live addresses are kept, so the cache still
+// does its job for everything on screen.
+func (m *Model) pruneDNSCache(conns []probe.Conn) {
+	if len(m.dnsCache) <= dnsCacheMax && len(m.dnsTried) <= dnsCacheMax {
+		return
+	}
+
+	live := make(map[string]bool, len(conns))
+	for _, c := range conns {
+		live[stripPort(c.Remote)] = true
+	}
+
+	for ip := range m.dnsCache {
+		if !live[ip] {
+			delete(m.dnsCache, ip)
+		}
+	}
+	for ip := range m.dnsTried {
+		if !live[ip] {
+			delete(m.dnsTried, ip)
+		}
+	}
+}
+
 // dnsDisplay returns the host portion to display for a remote "ip:port",
 // substituting the resolved name when reverse-DNS is enabled and known.
 func (m Model) dnsDisplay(remote string) string {

@@ -1,6 +1,9 @@
 package probe
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 type IfaceKind int
 
@@ -35,6 +38,42 @@ func (k IfaceKind) Label() string {
 	default:
 		return "unknown"
 	}
+}
+
+// MarshalJSON emits the label rather than the enum's integer value, so a
+// snapshot consumed by another tool (or fed back with --from) is self-
+// describing.
+func (k IfaceKind) MarshalJSON() ([]byte, error) {
+	return json.Marshal(k.Label())
+}
+
+// UnmarshalJSON accepts the label form MarshalJSON writes, and tolerates the
+// bare integer that older snapshots contain.
+func (k *IfaceKind) UnmarshalJSON(b []byte) error {
+	var label string
+	if err := json.Unmarshal(b, &label); err == nil {
+		*k = kindByLabel(label)
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	if n < 0 || n > int(IfacePhysical) {
+		n = int(IfaceUnknown)
+	}
+	*k = IfaceKind(n)
+	return nil
+}
+
+// kindByLabel is the inverse of Label.
+func kindByLabel(label string) IfaceKind {
+	for k := IfaceUnknown; k <= IfacePhysical; k++ {
+		if k.Label() == label {
+			return k
+		}
+	}
+	return IfaceUnknown
 }
 
 func ClassifyIface(name string) IfaceKind {

@@ -227,7 +227,7 @@ func (m Model) sortPorts(rows []probe.ListenPort) {
 	})
 }
 
-func (m Model) sortProcs(rows []probe.ProcNet) {
+func (m Model) sortProcs(rows []procRow) {
 	col := procsSortCols[m.procsSortCol]
 	if isRateSortCol(col) {
 		// Throughput lives in the model's rate and totals maps, not on the row,
@@ -236,9 +236,9 @@ func (m Model) sortProcs(rows []probe.ProcNet) {
 		sort.SliceStable(rows, func(i, j int) bool {
 			var c int
 			if m.showTotals {
-				c = cmpTotals(m.procTotal(rows[i].PID), m.procTotal(rows[j].PID), col)
+				c = cmpTotals(m.rowTotal(rows[i]), m.rowTotal(rows[j]), col)
 			} else {
-				c = cmpRate(m.procRate(rows[i].PID), m.procRate(rows[j].PID), col)
+				c = cmpRate(m.rowRate(rows[i]), m.rowRate(rows[j]), col)
 			}
 			if c == 0 {
 				c = cmpInt(int(rows[i].PID), int(rows[j].PID))
@@ -251,7 +251,7 @@ func (m Model) sortProcs(rows []probe.ProcNet) {
 		return
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
-		c := cmpProcs(rows[i], rows[j], col)
+		c := cmpProcs(rows[i].ProcNet, rows[j].ProcNet, col)
 		if m.procsSortDesc {
 			c = -c
 		}

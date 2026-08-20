@@ -32,9 +32,10 @@ const (
 	tabProcs
 	tabConns
 	tabEvents
+	tabRoutes
 	headerH  = 1
 	footerH  = 1
-	tabCount = 6
+	tabCount = 7
 )
 
 type tickMsg time.Time
@@ -201,15 +202,17 @@ type Model struct {
 
 	// Event log (see events.go): a ring buffer of things that changed, plus the
 	// bookkeeping needed to detect those changes.
-	events       []event
-	eventsVP     viewport.Model
-	eventsText   string
-	eventsCursor int
-	eventLog     *os.File
-	eventLogPath string
-	eventLogErr  error
-	dstSeen      map[string]bool // public remotes already reported this session
-	prevIfaceUp  map[string]bool
+	events        []event
+	eventsVP      viewport.Model
+	eventsText    string
+	eventsCursor  int
+	eventLog      *os.File
+	eventLogPath  string
+	eventLogBytes int64
+	eventLogMax   int64 // rotation threshold; eventLogMaxBytes when zero
+	eventLogErr   error
+	dstSeen       map[string]bool // public remotes already reported this session
+	prevIfaceUp   map[string]bool
 
 	// Throughput alert thresholds in bytes/sec (0 disables), the per-subject
 	// re-fire suppression, and the optional external hook (see alerts.go).
@@ -218,6 +221,15 @@ type Model struct {
 	alertFired   map[string]time.Time
 	alertHook    string
 	pendingHooks []event
+
+	// Non-throughput alert rules and the state their detection needs (see
+	// alerts.go): retransmit deltas, per-process connection counts and how many
+	// consecutive polls each process has been growing for.
+	alertRules        alertRules
+	prevRetrans       map[string]uint32
+	prevConnCounts    map[int32]int
+	connGrowth        map[int32]int
+	lastQualitySample time.Time
 
 	// Connections/ports quick filters (session-only, not persisted).
 	connStateFilter int  // 0 all · 1 established · 2 active (exclude teardown)
@@ -249,6 +261,51 @@ type Model struct {
 	// bytes moved this session.
 	showTotals   bool
 	sessionTotal byteTotals
+
+	// Collapse processes that share a name into one row (see procrows.go).
+	aggregateProcs bool
+
+	// Columns the user has hidden in the config, by column key.
+	hiddenCols map[string]bool
+
+	// Which interface each connection's local address belongs to, resolved once
+	// per poll, plus the interface the `i` filter is pinned to ("" for all).
+	connIface   map[string]string
+	ifaceFilter string
+
+	// Whether throughput is worded in bytes or bits per second.
+	rateUnit probe.RateUnit
+
+	// Connections opened and closed per poll, for the Overview churn chart.
+	churnUpHist, churnDownHist []float64
+
+	// Alerts recorded before this moment are considered read, so the tab badge
+	// can be cleared without destroying the log.
+	alertsAckedAt time.Time
+
+	// Quit confirmation, armed by `q`.
+	confirmingQuit bool
+
+	// Viewing a snapshot loaded from a file rather than the live host: nothing
+	// is sampled, and the header says so.
+	snapshotOnly bool
+
+	// Host network configuration (see routes.go), refreshed on its own slow
+	// cadence because it rarely changes.
+	routes        []probe.Route
+	neighbours    []probe.Neighbour
+	resolvers     []probe.Resolver
+	wifi          map[string]probe.WifiLink
+	hostStateErr  error
+	lastHostState time.Time
+	routesVP      viewport.Model
+	routesText    string
+
+	// Path latency (see latency.go): the probed targets' most recent samples
+	// and a short history each.
+	latency      []probe.LatencySample
+	latencyHist  map[string][]float64
+	latencyExtra []string // extra targets from the config, beyond the gateway
 	procTotals   map[int32]*talker
 	hostTotals   map[string]*talker
 
@@ -297,6 +354,7 @@ func NewModel() Model {
 	dvp := viewport.New(0, 0)
 	cvp := viewport.New(0, 0)
 	evp := viewport.New(0, 0)
+	rvp := viewport.New(0, 0)
 
 	ps := textinput.New()
 	ps.Placeholder = "search port / address / process"
@@ -328,6 +386,7 @@ func NewModel() Model {
 		procsVP:        kvp,
 		connsVP:        cvp,
 		eventsVP:       evp,
+		routesVP:       rvp,
 		ifaceDetailsVP: dvp,
 		portsSearch:    ps,
 		procsSearch:    qs,
@@ -395,11 +454,18 @@ func (m *Model) setRefreshInterval(faster bool) {
 }
 
 func (m Model) Init() tea.Cmd {
+	// A snapshot describes another machine at another time. Sampling this one
+	// would quietly replace it — so nothing is even asked for.
+	if m.snapshotOnly {
+		return nil
+	}
 	return tea.Batch(
 		m.refreshCmd(),
 		fetchConnInfoCmd(),
 		fetchExternalIPCmd(),
+		fetchHostStateCmd(),
 		extIPTickEvery(30*time.Second),
+		latencyTickEvery(latencyInterval),
 		tickEvery(m.refreshInterval),
 	)
 }
@@ -407,7 +473,12 @@ func (m Model) Init() tea.Cmd {
 // quit persists settings and ends the program. Used for every quit path so the
 // config is always written on a clean exit.
 func (m Model) quit() (tea.Model, tea.Cmd) {
-	m.saveConfig()
+	// A snapshot session forces some settings (totals, paused) and describes
+	// another machine; persisting any of it would surprise the next live run.
+	if !m.snapshotOnly {
+		m.saveConfig()
+		m.saveUsage()
+	}
 	if m.eventLog != nil {
 		_ = m.eventLog.Close()
 	}
@@ -560,6 +631,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.eventsVP.Width = max(10, eventsW-2)
 		m.eventsVP.Height = max(5, bodyH-4)
 
+		// Routes
+		routesW := min(m.w-2, 140)
+		m.routesVP.Width = max(10, routesW-2)
+		m.routesVP.Height = max(5, bodyH-4)
+		m.routesVP.SetContent(m.routesText)
+
 		// Row-detail overlay
 		if m.showDetail {
 			m.setDetail(m.detailText)
@@ -586,6 +663,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case externalIPMsg:
+		if m.snapshotOnly {
+			return m, nil // this host's address says nothing about the snapshot's
+		}
 		if msg.err != nil {
 			m.externalIPErr = msg.err
 			return m, nil
@@ -599,11 +679,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Always re-arm the ticker (so pause can be lifted and interval changes
 		// take effect); only actually sample when not paused.
 		cmds := []tea.Cmd{tickEvery(m.refreshInterval)}
+		if m.snapshotOnly {
+			return m, tea.Batch(cmds...) // a file has nothing more to give
+		}
 		if !m.paused {
 			cmds = append(cmds, m.refreshCmd())
 			if now := time.Now(); now.Sub(m.lastConnFetch) >= m.socketInterval() {
 				m.lastConnFetch = now
 				cmds = append(cmds, fetchConnInfoCmd())
+			}
+			if now := time.Now(); now.Sub(m.lastHostState) >= hostStateInterval {
+				m.lastHostState = now
+				cmds = append(cmds, fetchHostStateCmd())
 			}
 		}
 		return m, tea.Batch(cmds...)
@@ -612,6 +699,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(fetchExternalIPCmd(), extIPTickEvery(30*time.Second))
 
 	case snapMsg:
+		if m.snapshotOnly {
+			return m, nil
+		}
 		m.lastSnap = probe.NetSnapshot(msg)
 		m.err = nil
 
@@ -661,6 +751,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case connInfoMsg:
+		if m.snapshotOnly {
+			return m, nil
+		}
 		m.ports = msg.Ports
 		m.procs = msg.Procs
 		m.conns = msg.Conns
@@ -701,11 +794,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.connFirstSeen = next
 		m.connSeen = true
 
+		churnMax := max(30, min(200, m.w/2))
+		m.churnUpHist = probe.ClampHistory(append(m.churnUpHist, float64(m.connAdded)), churnMax)
+		m.churnDownHist = probe.ClampHistory(append(m.churnDownHist, float64(m.connRemoved)), churnMax)
+
 		curConns := make(map[string]probe.Conn, len(msg.Conns))
+		ifaceOf := make(map[string]string, len(msg.Conns))
 		for _, c := range msg.Conns {
 			curConns[connKey(c)] = c
+			// Resolved once per poll rather than per render: the answer only
+			// changes when the addresses do.
+			ifaceOf[connKey(c)] = probe.IfaceForIP(m.lastSnap.Ifaces, stripPort(c.Local))
 		}
 		m.prevConns = curConns
+		m.connIface = ifaceOf
 
 		// Flag listeners that appeared since the previous enumeration.
 		curPorts := make(map[string]probe.ListenPort, len(msg.Ports))
@@ -714,7 +816,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.newPorts = map[string]bool{}
 		if m.portSeen {
-			for k := range curPorts {
+			for k, p := range curPorts {
+				// Ephemeral UDP sockets churn with ordinary traffic; the event
+				// log already ignores them, and so must the badge.
+				if !probe.IsServiceListener(p) {
+					continue
+				}
 				if _, known := m.prevPorts[k]; !known {
 					m.newPorts[k] = true
 				}
@@ -726,11 +833,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.noteSocketEvents(prevPorts, msg.Conns, firstRun, now)
 		m.noteThroughputAlerts(msg.Conns, now)
+		m.noteQualityAlerts(msg.Conns, now)
 
 		m.portsCursor = clampInt(m.portsCursor, 0, len(m.filteredPorts())-1)
 		m.procsCursor = clampInt(m.procsCursor, 0, len(m.filteredProcs())-1)
 		m.connsCursor = clampInt(m.connsCursor, 0, m.connsRowCount()-1)
+		m.eventsCursor = clampInt(m.eventsCursor, 0, len(m.eventRows())-1)
 
+		m.pruneDNSCache(msg.Conns)
 		cmds := m.kickConnLookups()
 
 		m.portsText = hardClipLinesToWidth(m.renderPortsText(), m.portsVP.Width)
@@ -783,6 +893,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case hostStateMsg:
+		if m.snapshotOnly {
+			return m, nil // the routing table of the wrong machine is worse than none
+		}
+		m.routes = msg.routes
+		m.neighbours = msg.neighbours
+		m.resolvers = msg.resolvers
+		m.wifi = msg.wifi
+		m.hostStateErr = msg.err
+		m.routesText = hardClipLinesToWidth(m.renderRoutesText(), m.routesVP.Width)
+		m.routesVP.SetContent(m.routesText)
+		// The selected interface's radio state lives in the details pane.
+		m.ifaceDetailsText = hardClipLinesToWidth(
+			m.renderIfaceDetailsText(m.ifaceDetailsVP.Width), m.ifaceDetailsVP.Width)
+		m.ifaceDetailsVP.SetContent(m.ifaceDetailsText)
+		return m, nil
+
+	case latencyTickMsg:
+		cmds := []tea.Cmd{latencyTickEvery(latencyInterval)}
+		if !m.paused {
+			if probes := m.latencyTargets(); len(probes) > 0 {
+				cmds = append(cmds, measureLatencyCmd(probes))
+			}
+		}
+		return m, tea.Batch(cmds...)
+
+	case latencyResultMsg:
+		if m.snapshotOnly {
+			return m, nil
+		}
+		m.recordLatency(msg.samples)
+		return m, nil
+
 	case alertHookResultMsg:
 		if msg.err != nil {
 			m.status = "Alert hook failed: " + msg.err.Error()
@@ -831,6 +974,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// The quit confirmation captures all keys: y/q/enter leave, anything
+		// else stays.
+		if m.confirmingQuit {
+			switch msg.String() {
+			case "y", "Y", "q", "enter", "ctrl+c":
+				return m.quit()
+			}
+			m.confirmingQuit = false
+			m.status = "Still here"
+			return m, nil
+		}
+
 		// The kill confirmation captures all keys: only 'y' proceeds, ctrl+c
 		// quits, everything else cancels (fail-safe for a destructive action).
 		if m.confirmingKill {
@@ -868,8 +1023,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.anySearching() {
 				break
 			}
-			// disabled (no-op) so a stray 'q' can't quit
+			// A bare `q` used to be a no-op so a stray keypress could not end the
+			// session; asking instead is less surprising than doing nothing.
+			m.confirmingQuit = true
 			return m, nil
+
+		case "U":
+			// Bytes per second or bits per second: NICs and ISPs quote bits.
+			if !m.anySearching() {
+				if m.rateUnit == probe.UnitBytes {
+					m.rateUnit = probe.UnitBits
+					m.status = "Rates in bits/s"
+				} else {
+					m.rateUnit = probe.UnitBytes
+					m.status = "Rates in bytes/s"
+				}
+				m.rerenderActiveTable()
+				m.saveConfig()
+				return m, nil
+			}
+
+		case "d":
+			// Mark the alerts seen, without destroying the log.
+			if !m.anySearching() && m.activeTab == tabEvents {
+				m.alertsAckedAt = time.Now()
+				n := m.unreadAlerts()
+				m.rerenderActiveTable()
+				m.status = fmt.Sprintf("Acknowledged alerts (%d unread)", n)
+				return m, nil
+			}
+
+		case "i":
+			// Cycle which interface's connections are shown.
+			if !m.anySearching() && m.activeTab == tabConns {
+				m.cycleIfaceFilter()
+				return m, nil
+			}
 		case "tab", "right":
 			if m.anySearching() {
 				break
@@ -883,7 +1072,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeTab = (m.activeTab + tabCount - 1) % tabCount
 			return m, nil
 
-		case "1", "2", "3", "4", "5", "6":
+		case "1", "2", "3", "4", "5", "6", "7":
 			// Jump straight to a tab via its number (matches the "1 Overview" …
 			// labels in the header). While a search box is focused let the digit
 			// fall through to the text input instead of switching tabs.
@@ -968,8 +1157,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Refresh everything now, without waiting for the next tick.
 			if !m.anySearching() {
 				m.lastConnFetch = time.Now()
+				m.lastHostState = time.Now()
 				m.status = "Refreshing…"
-				return m, tea.Batch(m.refreshCmd(), fetchConnInfoCmd())
+				return m, tea.Batch(m.refreshCmd(), fetchConnInfoCmd(), fetchHostStateCmd(),
+					measureLatencyCmd(m.latencyTargets()))
 			}
 
 		case "r":
@@ -1062,6 +1253,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case " ":
 			// Pause / resume auto-refresh.
 			if !m.anySearching() {
+				if m.snapshotOnly {
+					m.status = "Viewing a snapshot — there is nothing to resume"
+					return m, nil
+				}
 				m.paused = !m.paused
 				if m.paused {
 					m.status = "Auto-refresh paused"
@@ -1186,6 +1381,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "A":
+			// Fold processes that share a name into one row, and back.
+			if !m.anySearching() && m.activeTab == tabProcs {
+				m.aggregateProcs = !m.aggregateProcs
+				m.resetTableCursor()
+				m.rerenderActiveTable()
+				m.scrollActiveTableTop()
+				if m.aggregateProcs {
+					m.status = "Grouping processes by name"
+				} else {
+					m.status = "Showing individual processes"
+				}
+				m.saveConfig()
+				return m, nil
+			}
+
 		case "t":
 			// Swap the throughput columns between current rate and session total.
 			if !m.anySearching() {
@@ -1220,6 +1431,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rerenderActiveTable()
 				m.scrollActiveTableTop()
 				m.status = fmt.Sprintf("Cleared %d events", n)
+				return m, nil
+			}
+
+		case "a":
+			// Accept (or un-accept) the highlighted listener as expected.
+			if !m.anySearching() && m.activeTab == tabPorts {
+				rows := m.filteredPorts()
+				if m.portsCursor < 0 || m.portsCursor >= len(rows) {
+					m.status = "No listener selected"
+					return m, nil
+				}
+				msg, ok := m.acceptListener(rows[m.portsCursor])
+				m.status = msg
+				if ok {
+					m.rerenderActiveTable()
+				}
+				return m, nil
+			}
+
+		case "w":
+			// Add (or remove) the highlighted remote from the watchlist.
+			if !m.anySearching() && m.activeTab == tabConns {
+				ip, ok := m.watchTarget()
+				if !ok {
+					m.status = "No connection selected"
+					return m, nil
+				}
+				msg, _ := m.toggleWatch(ip)
+				m.status = msg
+				m.rerenderActiveTable()
 				return m, nil
 			}
 
@@ -1394,6 +1635,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// The routes tab is reference material: it scrolls, but has no rows to
+	// select, sort or act on.
+	if m.activeTab == tabRoutes {
+		var cmd tea.Cmd
+		m.routesVP, cmd = m.routesVP.Update(msg)
+		return m, cmd
+	}
+
 	// Row-cursor tabs: cursor navigation, falling back to viewport scrolling
 	// for non-navigation messages (e.g. mouse wheel).
 	if m.hasRowCursor() {
@@ -1411,6 +1660,8 @@ func (m Model) View() string {
 
 	var body string
 	switch {
+	case m.confirmingQuit:
+		body = m.renderQuitConfirm()
 	case m.confirmingKill:
 		body = m.renderKillConfirm()
 	case m.showDetail:
@@ -1429,9 +1680,11 @@ func (m Model) View() string {
 		body = m.viewConns()
 	case m.activeTab == tabEvents:
 		body = m.viewEvents()
+	case m.activeTab == tabRoutes:
+		body = m.viewRoutes()
 	}
 
-	footer := subtleStyle.Render("Keys: ? help • 1-6 tabs • / search • n/N jump • ↑↓ select • enter details • s/S sort • t totals • z closed • f/o/p/v/u filter • b baseline • y copy • e export • x kill • R refresh")
+	footer := subtleStyle.Render("Keys: ? help • 1-7 tabs • / search • ↑↓ select • enter details • s/S sort • t totals • U units • A group • z closed • i/f/o/p/v/u filter • a/b baseline • w watch • d ack • y copy • e export • x kill • q quit")
 	if m.status != "" {
 		footer = okStyle.Render(m.status)
 	}
@@ -1452,11 +1705,14 @@ func (m Model) renderHeader() string {
 		renderTab("3 Ports", m.activeTab == tabPorts),
 		renderTab("4 Processes", m.activeTab == tabProcs),
 		renderTab("5 Connections", m.activeTab == tabConns),
-		renderTab(eventsTabLabel(m.events), m.activeTab == tabEvents),
+		renderTab(eventsTabLabel(m.unreadAlerts()), m.activeTab == tabEvents),
+		renderTab("7 Routes", m.activeTab == tabRoutes),
 	}
 
 	left := titleStyle.Render("ducknetview 🦆 "+version.Version) + " " + subtleStyle.Render(fmt.Sprintf("(%dx%d)", m.w, m.h))
-	if m.paused {
+	if m.snapshotOnly {
+		left += " " + warnStyle.Render("⏸ SNAPSHOT")
+	} else if m.paused {
 		left += " " + warnStyle.Render("⏸ PAUSED")
 	}
 
@@ -1489,7 +1745,7 @@ func (m Model) renderHelp() string {
 	b.WriteString(titleStyle.Render("ducknetview 🦆 — key bindings") + "\n\n")
 
 	section("Navigation")
-	row("1–6", "jump directly to a tab")
+	row("1–7", "jump directly to a tab")
 	row("←/→, tab", "switch / cycle tabs")
 	row("↑↓ (k/j)", "move row cursor / interface selection")
 	row("PgUp/PgDn", "page the cursor")
@@ -1505,6 +1761,8 @@ func (m Model) renderHelp() string {
 	row("s / S", "cycle sort column / reverse direction")
 	row("click", "click a column header to sort by it, again to reverse")
 	row("t", "throughput columns: current rate / session total")
+	row("U", "rates in bytes/s or bits/s")
+	row("A", "processes: fold rows sharing a name into one")
 	row("h", "toggle hide-noise interface filter")
 	row("ctrl+e", "refresh external IP now")
 	b.WriteString("\n")
@@ -1534,21 +1792,26 @@ func (m Model) renderHelp() string {
 	row("r", "toggle reverse DNS for remote addresses")
 	row("g", "toggle grouping by remote host")
 	row("z", "show connections that have closed, with final totals")
+	row("i", "filter by the interface the connection uses")
+	row("w", "add the highlighted remote to the watchlist")
 	b.WriteString("\n")
 
 	section("Listener baseline")
 	row("b", "save the current listeners as the expected set")
+	row("a", "accept just the highlighted listener into the baseline")
 	row("B", "clear the saved baseline")
 	b.WriteString("\n")
 
 	section("Events tab")
 	row("l", "cycle the level filter (all / warn+ / alerts)")
+	row("d", "acknowledge alerts (clears the badge, keeps the log)")
 	row("c", "clear the recorded events")
 	b.WriteString("\n")
 
 	section("General")
 	row("?", "toggle this help")
-	row("ctrl+c", "quit")
+	row("q", "quit (asks first)")
+	row("ctrl+c", "quit immediately")
 	b.WriteString("\n")
 	b.WriteString(subtleStyle.Render("press any key to close"))
 
@@ -1607,7 +1870,8 @@ func (m Model) viewOverview() string {
 			sec += " · " + okStyle.Render("baseline clean")
 		}
 	}
-	b.WriteString(sec + "\n\n")
+	b.WriteString(sec + "\n")
+	b.WriteString(clampToWidthOneLine(m.gatewayLine(), boxW-2) + "\n\n")
 
 	b.WriteString(titleStyle.Render("Selected interface") + "\n")
 	// The box's text capacity is boxW minus its horizontal padding (2); size the
@@ -1620,21 +1884,24 @@ func (m Model) viewOverview() string {
 	chartW := max(10, details-6)
 	b.WriteString(titleStyle.Render("Total (all interfaces)") + "\n")
 	b.WriteString(fmt.Sprintf("RX %s  (session peak %s)\n%s\n",
-		probe.HumanBytesPerSec(lastOr0(m.totalRxHist)),
-		subtleStyle.Render(probe.HumanBytesPerSec(m.totalPeak.rx)),
+		m.rate(lastOr0(m.totalRxHist)),
+		subtleStyle.Render(m.rate(m.totalPeak.rx)),
 		Spark(m.totalRxHist, chartW)))
 	b.WriteString(fmt.Sprintf("TX %s  (session peak %s)\n%s\n\n",
-		probe.HumanBytesPerSec(lastOr0(m.totalTxHist)),
-		subtleStyle.Render(probe.HumanBytesPerSec(m.totalPeak.tx)),
+		m.rate(lastOr0(m.totalTxHist)),
+		subtleStyle.Render(m.rate(m.totalPeak.tx)),
 		Spark(m.totalTxHist, chartW)))
 
 	// Top talkers are only worth the vertical space once traffic has been
 	// accounted, and only when the box is tall enough to hold them without
 	// pushing the external IP out of view.
-	if talkers := m.renderTopTalkers(details); talkers != "" {
+	for _, panel := range []string{m.renderLatency(details), m.renderTopTalkers(details), m.renderChurn(details)} {
+		if panel == "" {
+			continue
+		}
 		used := strings.Count(b.String(), "\n")
-		if used+strings.Count(talkers, "\n")+3 <= m.bodyHeight() {
-			b.WriteString(talkers)
+		if used+strings.Count(panel, "\n")+3 <= m.bodyHeight() {
+			b.WriteString(panel)
 		}
 	}
 
@@ -1744,10 +2011,19 @@ func (m Model) connsColumns() colSpecs {
 	colRate := 5
 	colRTT := 6
 	colRTX := 4
+	colIface := 8
 	colPID := 7
+
+	// The interface column only earns its width when connections actually span
+	// more than one link — on a single-NIC host every row would say the same
+	// thing.
+	showIface := m.multiIface()
 
 	// Remaining width split between LOCAL, REMOTE, PROCESS.
 	fixed := colProto + 2 + colSvc + 2 + colState + 2 + colAge + 2 + colPID + 2
+	if showIface {
+		fixed += colIface + 2
+	}
 	if m.hasThroughput {
 		fixed += 2*(colRate+2) + colRTT + 2 + colRTX + 2
 	}
@@ -1770,6 +2046,9 @@ func (m Model) connsColumns() colSpecs {
 		{key: "state", title: "STATE", width: colState, sort: "state"},
 		{key: "age", title: "AGE", width: colAge, sort: "age"},
 	}
+	if showIface {
+		cols = append(cols, colSpec{key: "iface", title: "IFACE", width: colIface, sort: "iface"})
+	}
 	if m.hasThroughput {
 		rxHdr, txHdr := m.trafficHeaders()
 		cols = append(cols,
@@ -1778,9 +2057,9 @@ func (m Model) connsColumns() colSpecs {
 			colSpec{key: "rtt", title: "RTT", width: colRTT, sort: "rtt"},
 			colSpec{key: "rtx", title: "RTX", width: colRTX, sort: "retrans"})
 	}
-	return append(cols,
+	return m.visible(append(cols,
 		colSpec{key: "pid", title: "PID", width: colPID, sort: "pid"},
-		colSpec{key: "process", title: "PROCESS", width: colProc, sort: "process"})
+		colSpec{key: "process", title: "PROCESS", width: colProc, sort: "process"}))
 }
 
 func (m Model) renderConnsText() string {
@@ -1809,6 +2088,7 @@ func (m Model) renderConnsText() string {
 	colRate := cols.width("rx")
 	colRTT := cols.width("rtt")
 	colRTX := cols.width("rtx")
+	colIface := cols.width("iface")
 	colPID := cols.width("pid")
 	colProc := cols.width("process")
 
@@ -1870,22 +2150,25 @@ func (m Model) renderConnsText() string {
 		pid := padRight(fmt.Sprintf("%d", c.PID), colPID)
 		procTr := q.highlight(trunc(proc, colProc))
 
-		rateSeg := ""
+		cells := map[string]string{
+			"proto": proto, "local": local, "remote": remote, "svc": svc,
+			"state": state, "age": age, "pid": pid, "process": procTr,
+			"iface": padRight(trunc(dashIfEmpty(m.ifaceFor(c)), colIface), colIface),
+		}
 		if m.hasThroughput {
-			rx, tx := m.trafficCells(m.connRate(c), m.connTotal(c), colRate)
+			cells["rx"], cells["tx"] = m.trafficCells(m.connRate(c), m.connTotal(c), colRate)
+			cells["rtt"] = padRight(formatRTT(c.RTT), colRTT)
 			// Retransmits are the difference between "slow" and "lossy", so a
 			// non-zero count is called out rather than just printed.
 			rtx := padRight(formatRetrans(c.Retrans), colRTX)
 			if c.Retrans > 0 {
-				rtx = warnStyle.Render(rtx)
+				cells["rtx"] = warnStyle.Render(rtx)
 			} else {
-				rtx = subtleStyle.Render(rtx)
+				cells["rtx"] = subtleStyle.Render(rtx)
 			}
-			rateSeg = rx + colSep + tx + colSep + padRight(formatRTT(c.RTT), colRTT) + colSep + rtx + colSep
 		}
 
-		b.WriteString(gutter(i == m.connsCursor) + fmt.Sprintf("%s  %s  %s  %s  %s  %s  %s%s  %s\n",
-			proto, local, remote, svc, state, age, rateSeg, pid, procTr))
+		b.WriteString(gutter(i == m.connsCursor) + cols.row(cells) + "\n")
 	}
 
 	return b.String()
@@ -1927,9 +2210,9 @@ func (m Model) groupColumns() colSpecs {
 			colSpec{key: "rx", title: rxHdr, width: colRate, sort: "bytes"},
 			colSpec{key: "tx", title: txHdr, width: colRate, sort: "bytes"})
 	}
-	return append(cols,
+	return m.visible(append(cols,
 		colSpec{key: "states", title: "STATES", width: colStates},
-		colSpec{key: "procs", title: "PROCESSES", width: colProc})
+		colSpec{key: "procs", title: "PROCESSES", width: colProc}))
 }
 
 // renderConnsGrouped renders the connections tab collapsed by remote host:
@@ -1994,14 +2277,14 @@ func (m Model) renderConnsGrouped() string {
 		statesCol := padRight(trunc(states, colStates), colStates)
 		procCol := q.highlight(trunc(procs, colProc))
 
-		rateSeg := ""
+		cells := map[string]string{
+			"host": remoteCol, "count": countCol, "states": statesCol, "procs": procCol,
+		}
 		if m.hasThroughput {
-			rx, tx := m.trafficCells(m.groupRate(g), m.hostTotal(g.ip), colRate)
-			rateSeg = rx + colSep + tx + colSep
+			cells["rx"], cells["tx"] = m.trafficCells(m.groupRate(g), m.hostTotal(g.ip), colRate)
 		}
 
-		b.WriteString(gutter(i == m.connsCursor) + fmt.Sprintf("%s  %s  %s%s  %s\n",
-			remoteCol, countCol, rateSeg, statesCol, procCol))
+		b.WriteString(gutter(i == m.connsCursor) + cols.row(cells) + "\n")
 	}
 
 	return b.String()
@@ -2026,14 +2309,14 @@ func (m Model) portsColumns() colSpecs {
 		rest = 5
 	}
 
-	return colSpecs{
+	return m.visible(colSpecs{
 		{key: "proto", title: "PR", width: colProto, sort: "proto"},
 		{key: "local", title: "LOCAL", width: colLocal, sort: "port"},
 		{key: "svc", title: "SERVICE", width: colSvc},
 		{key: "user", title: "USER", width: colUser, sort: "user"},
 		{key: "pid", title: "PID", width: colPID, sort: "pid"},
 		{key: "process", title: "PROCESS", width: rest, sort: "process"},
-	}
+	})
 }
 
 func (m Model) renderPortsText() string {
@@ -2114,7 +2397,10 @@ func (m Model) renderPortsText() string {
 		procTr := q.highlight(trunc(proc, rest))
 		pid := padRight(fmt.Sprintf("%d", p.PID), colPID)
 
-		b.WriteString(gutter(i == m.portsCursor) + fmt.Sprintf("%s  %s  %s  %s  %s  %s\n", proto, localTr, svcTr, userTr, pid, procTr))
+		b.WriteString(gutter(i == m.portsCursor) + cols.row(map[string]string{
+			"proto": proto, "local": localTr, "svc": svcTr,
+			"user": userTr, "pid": pid, "process": procTr,
+		}) + "\n")
 	}
 
 	return b.String()
@@ -2168,9 +2454,9 @@ func (m Model) procsColumns() colSpecs {
 			colSpec{key: "rx", title: rxHdr, width: colRate, sort: "rx"},
 			colSpec{key: "tx", title: txHdr, width: colRate, sort: "tx"})
 	}
-	return append(cols,
+	return m.visible(append(cols,
 		colSpec{key: "conns", title: "CONNS", width: colConns, sort: "conns"},
-		colSpec{key: "listen", title: "LISTEN", width: colListen, sort: "listen"})
+		colSpec{key: "listen", title: "LISTEN", width: colListen, sort: "listen"}))
 }
 
 func (m Model) renderProcsText() string {
@@ -2195,7 +2481,12 @@ func (m Model) renderProcsText() string {
 	colListen := cols.width("listen")
 
 	b.WriteString("Processes by network connections (proxy)\n")
-	sub := "↑↓ select • s/S sort: " + m.sortLabel() + " • y copy"
+	sub := "↑↓ select • s/S sort: " + m.sortLabel() + " • y copy • A "
+	if m.aggregateProcs {
+		sub += "per-process"
+	} else {
+		sub += "group by name"
+	}
 	if m.onlyMine {
 		sub += " • filter: " + m.filterLabel()
 	}
@@ -2218,7 +2509,7 @@ func (m Model) renderProcsText() string {
 			name = "-"
 		}
 
-		pidS := q.highlight(padRight(trunc(fmt.Sprintf("%d", p.PID), colPID), colPID))
+		pidS := q.highlight(padRight(trunc(p.pidCell(), colPID), colPID))
 		nameS := q.highlight(padRight(trunc(name, colName), colName))
 		userS := q.highlight(padRight(trunc(userOrDash(p.User), colUser), colUser))
 		cpuS := padRight(trunc(fmt.Sprintf("%.1f", p.CPU), colCPU), colCPU)
@@ -2325,6 +2616,18 @@ func (m Model) renderIfaceDetailsText(avail int) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("%s %s  %s  MTU %d\n", st.Render(state), titleStyle.Render(ii.Name), subtleStyle.Render(ii.Kind.Label()), ii.MTU))
 	b.WriteString(fmt.Sprintf("MAC: %s\n", ii.Hardware))
+	if w, ok := m.wifi[ii.Name]; ok {
+		// On a laptop or a handheld, "the network is slow" is very often "the
+		// radio is weak", which no amount of socket accounting reveals.
+		line := fmt.Sprintf("Wi-Fi: %.0f dBm (%s) · quality %d%%", w.Signal, w.Label(), w.SignalPercent())
+		if w.Noise != 0 {
+			line += fmt.Sprintf(" · noise %.0f dBm", w.Noise)
+		}
+		if w.SignalPercent() < 40 {
+			line = warnStyle.Render(line)
+		}
+		b.WriteString(line + "\n")
+	}
 	if len(ii.Addrs) > 0 {
 		b.WriteString("Addrs: " + strings.Join(ii.Addrs, ", ") + "\n")
 	}
@@ -2332,13 +2635,13 @@ func (m Model) renderIfaceDetailsText(avail int) string {
 
 	peak := m.ifacePeaks[ii.Name]
 	b.WriteString(fmt.Sprintf("RX: %s  (total %s, peak %s)\n%s\n\n",
-		probe.HumanBytesPerSec(ii.RxBps),
+		m.rate(ii.RxBps),
 		subtleStyle.Render(probe.HumanBytes(ii.RxTotal)),
-		subtleStyle.Render(probe.HumanBytesPerSec(peak.rx)), rx))
+		subtleStyle.Render(m.rate(peak.rx)), rx))
 	b.WriteString(fmt.Sprintf("TX: %s  (total %s, peak %s)\n%s\n",
-		probe.HumanBytesPerSec(ii.TxBps),
+		m.rate(ii.TxBps),
 		subtleStyle.Render(probe.HumanBytes(ii.TxTotal)),
-		subtleStyle.Render(probe.HumanBytesPerSec(peak.tx)), tx))
+		subtleStyle.Render(m.rate(peak.tx)), tx))
 
 	b.WriteString("\n" + fitLine(avail,
 		fmt.Sprintf("Packets: %s in/s · %s out/s", formatCount(ii.RxPps), formatCount(ii.TxPps)),
@@ -2687,6 +2990,8 @@ var tabNames = map[string]tab{
 	"connections": tabConns,
 	"conns":       tabConns,
 	"events":      tabEvents,
+	"routes":      tabRoutes,
+	"neighbours":  tabRoutes,
 }
 
 // TabNames lists the accepted --tab values, for the flag's error message.

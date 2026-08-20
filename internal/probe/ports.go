@@ -29,6 +29,20 @@ func connProto(c gnet.ConnectionStat) string {
 	}
 }
 
+// IsServiceListener reports whether a listening socket represents a service the
+// host offers, rather than a client socket that merely has a local port. UDP has
+// no LISTEN state, so an outbound DNS query is indistinguishable from a UDP
+// service by socket state alone; the ephemeral port range is the only signal
+// available, and treating those as services makes every count that includes them
+// fluctuate with ordinary traffic.
+func IsServiceListener(p ListenPort) bool {
+	if p.Proto != "udp" {
+		return true
+	}
+	_, port := SplitHostPort(p.Local)
+	return !IsEphemeralPort(port)
+}
+
 var (
 	ephemeralOnce sync.Once
 	ephemeralLow  = 32768 // conservative default if the sysctl is unreadable
