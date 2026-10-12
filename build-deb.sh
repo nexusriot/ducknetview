@@ -18,16 +18,20 @@ esac
 
 project="ducknetview_${version}_${arch}"
 folder_name="build/$project"
-echo "crating $folder_name"
+echo "creating $folder_name"
 mkdir -p $folder_name
 cp -r DEBIAN/ $folder_name
 bin_dir="$folder_name/usr/bin"
 mkdir -p $bin_dir
+# Build the package, not main.go: the command is several files, and naming one
+# of them silently produces no binary at all.
+set -e
 if [ "$arch" = "$(go env GOARCH)" ]; then
-  go build -ldflags "-linkmode external -extldflags -static" -o ducknetview cmd/ducknetview/main.go
+  go build -ldflags "-linkmode external -extldflags -static" -o ducknetview ./cmd/ducknetview
 else
-  CGO_ENABLED=0 GOARCH=$goarch go build -ldflags "-s -w" -o ducknetview cmd/ducknetview/main.go
+  CGO_ENABLED=0 GOARCH=$goarch go build -ldflags "-s -w" -o ducknetview ./cmd/ducknetview
 fi
+set +e
 
 mv ducknetview $bin_dir
 
@@ -43,7 +47,19 @@ cp completions/ducknetview.bash "$bash_dir/ducknetview"
 zsh_dir="$folder_name/usr/share/zsh/vendor-completions"
 mkdir -p "$zsh_dir"
 cp completions/_ducknetview "$zsh_dir/_ducknetview"
+
+# The headless mode is only useful if there is something to start it with.
+# Shipped disabled: installing a package should not start watching by itself.
+unit_dir="$folder_name/lib/systemd/system"
+mkdir -p "$unit_dir"
+cp packaging/ducknetview.service "$unit_dir/ducknetview.service"
 sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control
 sed -i "s/Architecture: .*/Architecture: $arch/" $folder_name/DEBIAN/control
+
+# Installed-Size is in KiB of the installed files, so it is computed from the
+# staged tree rather than hand-maintained: a hardcoded number goes stale the
+# first time the binary grows.
+installed_size="$(du -ks --exclude=DEBIAN "$folder_name" | cut -f1)"
+sed -i "s/_installed_size_/$installed_size/" $folder_name/DEBIAN/control
 
 cd build/ && dpkg-deb --build -Z gzip --root-owner-group $project

@@ -4,15 +4,20 @@
 _arguments -s \
   '--once[print a one-shot text snapshot and exit]' \
   '--json[print a snapshot as JSON and exit]' \
-  '--from[browse a --json snapshot instead of the live host]:snapshot file:_files' \
+  '--from[browse a --json snapshot, or ssh://host for a live remote view]:snapshot file:_files' \
+  '--diff[compare two --json snapshots and exit]:snapshots:_files' \
   '--metrics[print Prometheus metrics and exit]' \
+  '--metrics-listen[serve Prometheus metrics at /metrics on this address]:address:' \
+  '--daemon[run headless: poll, apply the alert rules and log events]' \
   '--top[print the N busiest processes and hosts]:count:' \
   '--usage[print recorded daily usage for the last N days]:days:' \
   '--usage-all[print all recorded daily usage]' \
   '--check-baseline[exit non-zero if listeners are unexpected]' \
+  '--check-config[report everything wrong with the saved config]' \
   '--baseline[baseline file to check against]:baseline file:_files' \
   '--save-baseline[write a portable baseline file]:baseline file:_files' \
   '--log-events[append events to a file as JSON lines]:log file:_files' \
   '--on-alert[run a command for each alert]:command:_command_names -e' \
-  '--tab[tab to open on start]:tab:(overview interfaces ports processes connections events routes)' \
-  '--version[print the version and exit]'
+  '--tab[tab to open on start]:tab:(overview interfaces ports processes procs connections conns events routes neighbours)' \
+  '--version[print the version and exit]' \
+  '--help[print the option list and exit]'

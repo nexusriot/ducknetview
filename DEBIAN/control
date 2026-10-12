@@ -1,6 +1,19 @@
 Package: ducknetview
 Version: _version_
 Architecture: amd64
+Section: net
+Priority: optional
 Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
-Description: Simple network monitoring TUI
-Installed-Size: 7300
+Homepage: https://github.com/nexusriot/ducknetview
+Installed-Size: _installed_size_
+Description: terminal network monitoring TUI
+ ducknetview watches a host's network from the terminal: interfaces and their
+ throughput, listening sockets, per-process and per-connection traffic, active
+ and recently closed connections, a log of what changed, and the routing
+ configuration.
+ .
+ On Linux, per-connection throughput, round-trip time and retransmit counts are
+ read from the kernel's sock_diag netlink interface - the same source ss(8)
+ uses - so no elevated privileges are required. Listening sockets can be
+ recorded as a baseline and checked from cron, and the whole state can be
+ exported as JSON or Prometheus metrics.

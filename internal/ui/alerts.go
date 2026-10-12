@@ -158,10 +158,15 @@ type alertRules struct {
 	retransPerMin float64 // retransmits per minute on one socket
 	connGrowth    int     // consecutive polls of growth before calling it a leak
 	fanoutHosts   int     // distinct new remotes for one process in one poll
+	// Link health. Errors and drops were collected and displayed from the
+	// start but could not fire anything, which made the interface the one
+	// measured thing the tool could not tell you about.
+	ifaceDropsPerMin float64
 }
 
 func (r alertRules) any() bool {
-	return r.rttMs > 0 || r.retransPerMin > 0 || r.connGrowth > 0 || r.fanoutHosts > 0
+	return r.rttMs > 0 || r.retransPerMin > 0 || r.connGrowth > 0 || r.fanoutHosts > 0 ||
+		r.ifaceDropsPerMin > 0
 }
 
 // noteQualityAlerts applies the non-throughput rules. It runs after the rate
@@ -292,4 +297,59 @@ func (m Model) procNameFor(pid int32) string {
 		return t.label
 	}
 	return ""
+}
+
+// noteIfaceAlerts fires on a link that is dropping or erroring packets. The
+// counters are cumulative since boot, so the rule is a rate: a link that lost
+// a handful of packets last week is not a problem, and one losing them now is.
+func (m *Model) noteIfaceAlerts(snap probe.NetSnapshot) {
+	if m.alertRules.ifaceDropsPerMin <= 0 {
+		return
+	}
+	if m.alertFired == nil {
+		m.alertFired = map[string]time.Time{}
+	}
+
+	now := snap.TakenAt
+	if now.IsZero() {
+		now = time.Now()
+	}
+	cur := make(map[string]uint64, len(snap.Ifaces))
+	for _, ii := range snap.Ifaces {
+		cur[ii.Name] = ii.LinkProblems()
+	}
+
+	dt := now.Sub(m.lastIfaceSample).Seconds()
+	// The first sample is the baseline: without one, every counter accumulated
+	// since boot would read as having happened in this instant.
+	if m.lastIfaceSample.IsZero() || dt <= 0 {
+		m.prevIfaceProblems, m.lastIfaceSample = cur, now
+		return
+	}
+
+	rec := m.newEventRecorder(now)
+	defer rec.flush()
+
+	for _, ii := range snap.Ifaces {
+		prev, ok := m.prevIfaceProblems[ii.Name]
+		if !ok {
+			continue
+		}
+		delta := deltaBytes(cur[ii.Name], prev)
+		if delta == 0 {
+			continue
+		}
+		perMin := float64(delta) / dt * 60
+		if perMin < m.alertRules.ifaceDropsPerMin {
+			continue
+		}
+		if m.shouldFire("iface:"+ii.Name, now) {
+			rec.add(levelWarn, "link_errors", ii.Name,
+				fmt.Sprintf("%.0f errors+drops/min over threshold %.0f",
+					perMin, m.alertRules.ifaceDropsPerMin))
+		}
+	}
+
+	m.prevIfaceProblems, m.lastIfaceSample = cur, now
+	m.pruneAlertHistory(now)
 }

@@ -24,7 +24,10 @@ import (
 const (
 	exitOK        = 0
 	exitOffending = 1 // --check-baseline found listeners outside the baseline
-	exitUsage     = 2
+	// exitDifferences is the same code for the same reason diff(1) uses it:
+	// "the comparison succeeded and the answer is no".
+	exitDifferences = 1 // --diff found changes between the two snapshots
+	exitUsage       = 2
 )
 
 func main() {
@@ -36,17 +39,29 @@ func main() {
 	logEvents := flag.String("log-events", "", "append events (new listeners, watchlist hits, interface changes) to a file as JSON lines")
 	onAlert := flag.String("on-alert", "", "command to run for each alert-level event (receives kind, subject and detail as arguments)")
 	startTab := flag.String("tab", "", "tab to open on start: "+strings.Join(ui.TabNames(), ", "))
-	fromFile := flag.String("from", "", "browse a --json snapshot instead of the live host (\"-\" reads stdin)")
+	fromFile := flag.String("from", "", "browse a --json snapshot instead of the live host (\"-\" reads stdin); ssh://[user@]host polls that host live")
 	metrics := flag.Bool("metrics", false, "print the host's network state in Prometheus text format and exit")
 	top := flag.Int("top", 0, "print the N busiest processes and hosts and exit")
 	usage := flag.Int("usage", 0, "print the recorded daily usage for the last N days and exit (see -usage-all)")
 	showUsage := flag.Bool("usage-all", false, "print all recorded daily usage and exit")
+	daemon := flag.Bool("daemon", false, "run headless: poll, apply the alert rules and log events, with no TUI (SIGHUP reloads the config)")
+	metricsListen := flag.String("metrics-listen", "", "serve Prometheus metrics at /metrics on this address (e.g. 127.0.0.1:9847)")
+	diff := flag.Bool("diff", false, "compare two --json snapshots given as arguments and exit")
+	checkConfig := flag.Bool("check-config", false, "report everything wrong with the saved config and exit non-zero if anything is")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("ducknetview " + version.Version)
 		return
+	}
+
+	if *diff {
+		os.Exit(runDiff(flag.Args()))
+	}
+
+	if *checkConfig {
+		os.Exit(runCheckConfig())
 	}
 
 	if *saveBaseline != "" {
@@ -58,6 +73,23 @@ func main() {
 			log.Fatal(err)
 		}
 		return
+	}
+
+	if *daemon {
+		os.Exit(runDaemon(*logEvents, *onAlert, *metricsListen))
+	}
+
+	// Serving metrics without --daemon is a perfectly good exporter on its own,
+	// so it runs alongside the TUI rather than instead of it. The listener is
+	// bound here, before the program is built, so a taken port is reported on
+	// a usable terminal rather than from inside the alt screen.
+	var exporter *metricsServer
+	if *metricsListen != "" {
+		var err error
+		if exporter, err = serveMetrics(*metricsListen); err != nil {
+			log.Fatalf("metrics listener: %v", err)
+		}
+		defer exporter.Close()
 	}
 
 	if *top > 0 {
@@ -95,11 +127,18 @@ func main() {
 
 	m := ui.NewModel().WithConfig()
 	if *fromFile != "" {
-		snap, err := ui.LoadSnapshot(*fromFile)
-		if err != nil {
-			log.Fatal(err)
+		if ui.IsRemoteTarget(*fromFile) {
+			var err error
+			if m, err = m.WithRemote(*fromFile); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			snap, err := ui.LoadSnapshot(*fromFile)
+			if err != nil {
+				log.Fatal(err)
+			}
+			m = m.WithSnapshot(snap)
 		}
-		m = m.WithSnapshot(snap)
 	}
 	if *logEvents != "" {
 		var err error
@@ -122,6 +161,11 @@ func main() {
 		tea.WithAltScreen(),
 		tea.WithMouseAllMotion(),
 	)
+	if exporter != nil {
+		// The TUI's model is as live as the daemon's, so a scrape should read
+		// it rather than enumerate every socket a second time.
+		exporter.Attach(p)
+	}
 
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
@@ -245,34 +289,86 @@ func runTop(n int) error {
 	return nil
 }
 
-// runSnapshot samples the system once and prints it to stdout, for scripting /
-// piping. It takes two interface samples ~1s apart so RX/TX rates are non-zero.
-func runSnapshot(asJSON bool) error {
+// collectHostState reads the host's routing configuration for a snapshot. It
+// runs while the sampler is waiting out its one-second interval, so carrying it
+// costs no extra wall time. Failures are not fatal: a snapshot without routes
+// is still a useful snapshot, and the viewer says which it is looking at.
+func collectHostState(snap *ui.Snapshot) {
+	if routes, err := probe.Routes(); err == nil {
+		snap.Routes = routes
+	}
+	if ns, err := probe.Neighbours(); err == nil {
+		snap.Neighbours = ns
+	}
+	if rs, err := probe.Resolvers(); err == nil {
+		snap.Resolvers = rs
+	}
+	if w, err := probe.WifiLinks(); err == nil && len(w) > 0 {
+		snap.Wifi = w
+	}
+	// One measurement of the first hop, which is what the live Overview probes
+	// by default. Nothing else is dialled, so a snapshot still sends no traffic
+	// off the LAN.
+	if t, ok := probe.GatewayTarget(snap.Routes); ok {
+		snap.Latency = []probe.LatencySample{probe.MeasureLatency(t, snapshotLatencyTimeout)}
+	}
+}
+
+// snapshotLatencyTimeout bounds the one gateway probe a snapshot takes, so a
+// --json on a host with no reachable gateway is not noticeably slower.
+const snapshotLatencyTimeout = 900 * time.Millisecond
+
+// takeSnapshot samples the system once. It takes two interface samples ~1s
+// apart so RX/TX rates are non-zero, and reads the host's configuration during
+// that interval.
+func takeSnapshot() (ui.Snapshot, probe.NetSnapshot, probe.ConnInfo, error) {
 	s := probe.NewNetSampler()
 	if _, err := s.Sample(); err != nil { // prime the counters
-		return err
+		return ui.Snapshot{}, probe.NetSnapshot{}, probe.ConnInfo{}, err
 	}
+
+	var out ui.Snapshot
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		collectHostState(&out)
+	}()
+
 	time.Sleep(time.Second)
 	snap, err := s.Sample()
 	if err != nil {
-		return err
+		<-done
+		return ui.Snapshot{}, probe.NetSnapshot{}, probe.ConnInfo{}, err
 	}
 	info, err := probe.Collect(0) // no process limit for a snapshot
+	if err != nil {
+		<-done
+		return ui.Snapshot{}, probe.NetSnapshot{}, probe.ConnInfo{}, err
+	}
+	<-done
+
+	out.Hostname = snap.Hostname
+	out.UptimeSeconds = int64(snap.Uptime.Seconds())
+	out.TakenAt = snap.TakenAt.Format(time.RFC3339)
+	out.Version = version.Version
+	out.Interfaces = snap.Ifaces
+	out.Ports = info.Ports
+	out.Processes = info.Procs
+	out.Connections = info.Conns
+	return out, snap, info, nil
+}
+
+// runSnapshot samples the system once and prints it to stdout, for scripting /
+// piping.
+func runSnapshot(asJSON bool) error {
+	out, snap, info, err := takeSnapshot()
 	if err != nil {
 		return err
 	}
 
 	if asJSON {
-		out := map[string]any{
-			"hostname":       snap.Hostname,
-			"uptime_seconds": int64(snap.Uptime.Seconds()),
-			"taken_at":       snap.TakenAt.Format(time.RFC3339),
-			"version":        version.Version,
-			"interfaces":     snap.Ifaces,
-			"ports":          info.Ports,
-			"processes":      info.Procs,
-			"connections":    info.Conns,
-		}
+		// Marshalling the viewer's own type is what keeps --json and --from
+		// from drifting apart.
 		b, err := json.MarshalIndent(out, "", "  ")
 		if err != nil {
 			return err

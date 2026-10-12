@@ -1,4 +1,4 @@
-.TH DUCKNETVIEW 1 "2026-08" "ducknetview" "User Commands"
+.TH DUCKNETVIEW 1 "2026-10" "ducknetview 0.5.1" "User Commands"
 .SH NAME
 ducknetview \- terminal network monitor
 .SH SYNOPSIS
@@ -32,11 +32,69 @@ snapshot instead of the live host.
 .B \-
 reads standard input, so
 .RB ` "ssh host ducknetview --json | ducknetview --from -" '
-browses a remote host.
+browses a remote host. Given
+.BI ssh:// [user@]host
+instead of a file, the snapshot is re-fetched over
+.BR ssh (1)
+on the refresh interval, which makes the view live: two consecutive fetches
+carry the same counters a local poll would, so throughput, totals, events and
+the alert rules all work on the remote host. Nothing needs to be installed
+there beyond the binary itself.
+.TP
+.B \-\-diff
+Compare the two
+.B \-\-json
+snapshots named as arguments and exit, reporting the listeners, processes,
+remote hosts and interfaces that differ. Exits
+.B 0
+when they match and
+.B 1
+when they do not, like
+.BR diff (1).
+.TP
+.B \-\-daemon
+Run headless: poll, apply every alert rule, record the daily usage and write
+events to standard output, with no interface. This is the shape the alerting
+wants — the moment nobody is watching is the moment it matters. Combine it
+with
+.BR \-\-log\-events ,
+.B \-\-on\-alert
+and
+.BR \-\-metrics\-listen .
+It stops on
+.B SIGINT
+or
+.BR SIGTERM ,
+persisting the session's totals first, and re-reads its configuration on
+.B SIGHUP
+without losing them: a restart to pick up a new threshold would throw away the
+session totals, the event ring and the rate baselines, which are most of what a
+long-running daemon accumulates. A reload is itself recorded as a
+.B config_reloaded
+event, at warning level when part of the new configuration had to be ignored.
 .TP
 .B \-\-metrics
 Print the host's network state in Prometheus text format and exit, for a
 node_exporter textfile directory.
+.TP
+.BI \-\-metrics\-listen " address"
+Serve the same metrics over HTTP at
+.I address
+(for example
+.BR :9847 )
+under
+.BR /metrics ,
+so Prometheus can scrape directly rather than reading a textfile. It runs
+alongside the TUI or the daemon, and is answered from that session's own state
+rather than by sampling the host again — which also exports what only a running
+session knows: how long since the last completed poll, how many polls and
+events there have been, the session's accumulated byte totals, and how many
+alerts and failed hooks. The poll age is the one metric that can reveal a
+monitor which is up but no longer working. Scrapes are cached for five seconds
+and, if the session cannot answer within two, fall back to sampling. Note that
+this binds a listening socket: give it an explicit address such as
+.B 127.0.0.1:9847
+unless the exporter really should be reachable from the network.
 .TP
 .BI \-\-top " n"
 Print the
@@ -46,9 +104,10 @@ busiest processes and hosts and exit.
 .BI \-\-usage " days"
 Print the recorded daily usage for the last
 .I days
-days.
+days and exit.
+.TP
 .B \-\-usage\-all
-prints everything recorded.
+Print every recorded day of usage and exit.
 .TP
 .B \-\-check\-baseline
 Compare the host's listeners against the saved baseline. Exits
@@ -58,6 +117,22 @@ when clean,
 when unexpected listeners are present, and
 .B 2
 when no baseline has been saved.
+.TP
+.B \-\-check\-config
+Report everything wrong with the saved configuration and exit. The loader is
+deliberately forgiving — an out-of-range value falls back to its default and a
+malformed one is skipped, so that a hand-edited file can never wedge the
+interface — and the cost of that forgiveness is silence. A watchlist regular
+expression that does not compile, a latency target with no port, a hidden
+column key that names nothing, a binding for an action that does not exist and
+a misspelt key all simply do nothing, for ever. This reports all of them at
+once. Exits
+.B 0
+when the config is entirely usable,
+.B 1
+when anything in it is being ignored, and
+.B 2
+when the file could not be read or parsed at all.
 .TP
 .BI \-\-baseline " file"
 Check against a baseline file rather than the per-user one.
@@ -88,6 +163,9 @@ events or routes.
 .TP
 .B \-\-version
 Print the version and exit.
+.TP
+.B \-\-help
+Print the option list and exit.
 .SH KEYS
 .TP
 .B 1\-7
@@ -127,6 +205,20 @@ clears it.
 .B w
 Add the highlighted connection's remote to the watchlist.
 .TP
+.B F
+Follow the highlighted process or listener into the connections it accounts
+for, and press it again on the Connections tab to go back.
+.TP
+.B T
+On the Processes tab, arrange the rows as a tree of what started what.
+.B A
+folds rows sharing a name instead; the two are exclusive.
+.TP
+.B ,
+Open the settings overlay: the alert thresholds, the latency targets, the
+hidden columns and the theme, all of which previously had to be hand-edited in
+the config file. Changes are written out as they are made.
+.TP
 .B x
 Signal the highlighted row's process, confirming with
 .BR t / k / h
@@ -143,17 +235,138 @@ Settings, the watchlist, the listener baseline and the alert thresholds.
 .TP
 .I ${XDG_CONFIG_HOME:-~/.config}/ducknetview/usage.json
 Recorded daily traffic totals.
+.TP
+.I ${XDG_CONFIG_HOME:-~/.config}/ducknetview/trend.json
+A day of per\-minute throughput peaks, so the Overview can show what happened
+before the session started.
+.SH CONFIGURATION
+Almost every setting is written to the config file as it is changed in the TUI
+and restored on the next launch: the sort columns and directions, the quick
+filters, the hide\-noise / reverse\-DNS / grouping / totals / aggregate toggles,
+the rate unit, the search mode, the refresh interval, the last open tab, the
+watchlist and the listener baseline. Unknown keys are ignored and out\-of\-range
+values fall back to the default, so an old or hand\-mangled file cannot wedge the
+UI.
+.PP
+The thresholds, the latency targets, the hidden columns and the theme are all
+editable from the settings overlay
+.RB ( , ),
+which writes this file as changes are made. They can equally be edited by hand:
+.TP
+.B hidden_columns
+An array of column keys to leave out of the tables, for narrow terminals. A
+hidden column stays sortable with
+.BR s .
+Valid keys: age, closed, conns, container, count, cpu, host, iface, life,
+listen, local, mem, name, pid, process, procs, proto, remote, rtt, rtx, rx,
+state, states, svc, tx, user. Hiding every column of a table is ignored.
+.TP
+.B latency_targets
+An array of extra
+.IR host : port
+probes for the Overview's latency panel. The default gateway is always probed;
+anything listed here may leave the LAN, which is why it is opt\-in.
+.TP
+.B watchlist
+An array of CIDRs, bare IPs or regular expressions. Each is tested against the
+remote IP and its resolved hostname; matches are highlighted and logged as
+events.
+.B w
+adds and removes the highlighted remote.
+.TP
+.B "alert_process_bps, alert_connection_bps, alert_rtt_ms, alert_retrans_per_min, alert_conn_growth_polls, alert_fanout_hosts, alert_iface_drops_per_min"
+The alert thresholds: bytes per second for a process or a single connection,
+smoothed round\-trip time in milliseconds, retransmits per minute on one socket,
+consecutive polls of connection growth before calling it a leak, new remote
+hosts in one poll before calling it fan\-out, and errors plus drops per minute
+on one interface. Each is off when absent or
+.BR 0 ,
+since the right number is site\-specific, and each re\-fires at most once a
+minute per subject.
+.TP
+.B asn_database
+Path to an ip2asn table (the five\-column TSV published by iptoasn.com, plain
+or gzipped). With one, an OWNER column appears on the Connections tab and the
+detail overlay names the autonomous system behind each public address. Nothing
+is bundled and no lookup leaves the host; without the key the column simply
+does not exist.
+.TP
+.B theme
+Colour palette:
+.BR default ,
+.B contrast
+or
+.BR mono .
+.B NO_COLOR
+still overrides all of them.
+.TP
+.B keys
+Key bindings, as action name to key — for example
+.BR "\(dqclosed\(dq: \(dqZ\(dq" .
+An unknown action, a reserved key (ctrl\-c, tab, the arrows, the digits) or a
+key already taken by another action is ignored rather than obeyed, so a bad
+config cannot leave the tool unusable. The help overlay renders what is
+actually bound.
+.TP
+.B process_tree
+Whether the Processes tab opens as a tree.
 .SH ENVIRONMENT
 .TP
 .B NO_COLOR
 Disable colour entirely.
+.SH METRICS
+Both metric modes export the host's state:
+.BR ducknetview_iface_receive_bytes_per_second ,
+.BR ducknetview_iface_transmit_bytes_per_second ,
+.BR ducknetview_iface_errors_total ,
+.BR ducknetview_iface_up ,
+.BR ducknetview_listeners ,
+.BR ducknetview_listeners_off_baseline " (\-1 when no baseline is saved, which is not the same as clean),"
+.BR ducknetview_connections ,
+.B ducknetview_connection_retransmits_total
+and
+.BR ducknetview_processes_with_sockets .
+.PP
+A scrape answered by a running session adds what only it can report:
+.BR ducknetview_build_info ,
+.BR ducknetview_session_uptime_seconds ,
+.BR ducknetview_last_poll_age_seconds ,
+.BR ducknetview_polls_total ,
+.BR ducknetview_paused ,
+.BR ducknetview_session_bytes_total ,
+.BR ducknetview_events_total ,
+.BR ducknetview_alerts_total ,
+.B ducknetview_alert_hook_failures_total
+and, for a
+.B \-\-from ssh://
+session,
+.BR ducknetview_remote_up .
+.PP
+.B ducknetview_last_poll_age_seconds
+is the one worth alerting on first: it is \-1 before the first poll and grows
+without bound if the session stops working, which no other metric here reveals.
+The README documents the labels and the event kinds that
+.B ducknetview_events_total
+is broken down by.
+.SH SIGNALS
+.TP
+.B SIGHUP
+Re-read the configuration without restarting. The session's totals, event ring
+and rate baselines are kept.
+.TP
+.B SIGINT ", " SIGTERM
+Persist the day's usage totals and exit.
 .SH EXIT STATUS
 .B 0
 on success,
 .B 1
 when
 .B \-\-check\-baseline
-finds unexpected listeners, and
+finds unexpected listeners,
+.B \-\-check\-config
+finds problems or
+.B \-\-diff
+finds changes, and
 .B 2
 for a usage or collection error.
 .SH SEE ALSO

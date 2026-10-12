@@ -153,6 +153,11 @@ func (m Model) passUserFilter(owner string) bool {
 // passConnFilters combines the protocol, IP-version, state and user quick
 // filters for a connection row (used by both the flat and grouped views).
 func (m Model) passConnFilters(c probe.Conn) bool {
+	// The drill is checked first: it is the narrowest thing on screen, and the
+	// cheapest to reject on.
+	if !m.drill.matches(c) {
+		return false
+	}
 	if !m.passProtoFilter(c.Proto) || !m.passIPVerFilter(c.Remote) || !m.passUserFilter(c.User) {
 		return false
 	}
@@ -193,7 +198,7 @@ func (m Model) isWatchedIP(ip string) bool {
 // decide whether to show the filter summary line).
 func (m Model) anyFilterActive() bool {
 	return m.connStateFilter != 0 || m.protoFilter != 0 || m.ipVerFilter != 0 ||
-		m.publicOnly || m.onlyMine || m.ifaceFilter != ""
+		m.publicOnly || m.onlyMine || m.ifaceFilter != "" || m.drill != nil
 }
 
 // filterLabel describes the active quick filters, e.g. "tcp · established".
@@ -225,6 +230,9 @@ func (m Model) filterLabel() string {
 	}
 	if m.ifaceFilter != "" {
 		parts = append(parts, m.ifaceFilter)
+	}
+	if d := m.drill.describe(); d != "" {
+		parts = append(parts, d+" (F to go back)")
 	}
 	if len(parts) == 0 {
 		return "none"
@@ -293,6 +301,12 @@ func (m Model) filteredProcs() []procRow {
 		out = aggregateByName(out)
 	}
 	m.sortProcs(out)
+	// The tree is applied last: it rearranges rows the sort has already
+	// ordered, so siblings keep whatever order the sort chose. Folding by name
+	// has already destroyed the parent relationships, so the two are exclusive.
+	if m.procTree && !m.aggregateProcs {
+		out = arrangeTree(out)
+	}
 	return out
 }
 

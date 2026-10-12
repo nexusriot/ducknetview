@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"syscall"
@@ -29,6 +30,38 @@ type LatencySample struct {
 
 // OK reports whether the sample carries a usable round-trip time.
 func (s LatencySample) OK() bool { return s.Err == nil && s.RTT > 0 }
+
+// latencySampleJSON is the on-the-wire shape. An error interface cannot be
+// unmarshalled back, so a snapshot that carried one would fail to load
+// entirely; the message is what matters anyway.
+type latencySampleJSON struct {
+	Label string    `json:"label"`
+	Addr  string    `json:"addr,omitempty"`
+	RTTNs int64     `json:"rtt_ns"`
+	At    time.Time `json:"at"`
+	Err   string    `json:"error,omitempty"`
+}
+
+func (s LatencySample) MarshalJSON() ([]byte, error) {
+	out := latencySampleJSON{Label: s.Label, Addr: s.Addr, RTTNs: int64(s.RTT), At: s.At}
+	if s.Err != nil {
+		out.Err = s.Err.Error()
+	}
+	return json.Marshal(out)
+}
+
+func (s *LatencySample) UnmarshalJSON(b []byte) error {
+	var in latencySampleJSON
+	if err := json.Unmarshal(b, &in); err != nil {
+		return err
+	}
+	s.Label, s.Addr, s.RTT, s.At = in.Label, in.Addr, time.Duration(in.RTTNs), in.At
+	s.Err = nil
+	if in.Err != "" {
+		s.Err = errors.New(in.Err)
+	}
+	return nil
+}
 
 // MeasureLatency times a TCP handshake against the target. A refused
 // connection counts as a success: the RST travelled the same path a SYN-ACK

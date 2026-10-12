@@ -34,6 +34,8 @@ type Neighbour struct {
 	Iface  string
 	Vendor string // best-effort OUI lookup, "" when unknown
 	Stale  bool   // the kernel has no confirmed mapping
+	IPv6   bool
+	State  string // the kernel's cache state, as `ip neigh` words it
 }
 
 // Resolver is a nameserver the host is configured to use.
@@ -192,10 +194,14 @@ func hexIPv6(s string) (net.IP, bool) {
 	return net.IP(b), true
 }
 
-// Neighbours reads the IPv4 neighbour (ARP) table. IPv6 neighbours live only in
-// netlink, not /proc, so they are not covered here.
+// procNetARP is the IPv4-only fallback source, used when the netlink dump is
+// unavailable.
+const procNetARP = "/proc/net/arp"
+
+// Neighbours reads the kernel's neighbour cache for both address families. On
+// Linux this is an rtnetlink dump, because /proc/net/arp has never carried IPv6.
 func Neighbours() ([]Neighbour, error) {
-	return readNeighbours("/proc/net/arp")
+	return readNeighbourCache()
 }
 
 func readNeighbours(path string) ([]Neighbour, error) {

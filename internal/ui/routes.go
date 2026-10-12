@@ -59,8 +59,11 @@ func fetchHostStateCmd() tea.Cmd {
 
 // gatewayLine summarises the default route for the Overview.
 func (m Model) gatewayLine() string {
-	if m.snapshotOnly {
-		return subtleStyle.Render("Gateway: not carried in a snapshot")
+	if m.snapshotOnly && !m.snapshotHostState {
+		if m.remoteLive() {
+			return subtleStyle.Render("Gateway: waiting for the first fetch from " + m.remoteHost)
+		}
+		return subtleStyle.Render("Gateway: not carried in this snapshot")
 	}
 	def, ok := probe.DefaultRoute(m.routes)
 	if !ok {
@@ -90,12 +93,12 @@ func (m Model) renderRoutesText() string {
 		w = 120
 	}
 
-	if m.snapshotOnly {
-		return "This is a snapshot of another host.\n\n" +
+	if m.snapshotOnly && !m.snapshotHostState && !m.remoteLive() {
+		return "This snapshot does not carry the host's network configuration.\n\n" +
 			subtleStyle.Render("Routes, neighbours, nameservers and radio state are read from /proc, so they\n"+
-				"describe the machine the tool is running on. Showing this host's routing\n"+
-				"table next to another host's sockets would be worse than showing none, so\n"+
-				"the snapshot format does not carry them and this tab stays empty.")
+				"describe whichever machine produced the snapshot. Snapshots written before\n"+
+				"0.4.0 left them out; re-take it with a current ducknetview and this tab will\n"+
+				"describe the remote host instead of this one.")
 	}
 
 	if m.hostStateErr != nil {
@@ -142,12 +145,21 @@ func (m Model) renderRoutesText() string {
 			dest, trunc(gw, 24), trunc(r.Iface, 10), r.Metric))
 	}
 
-	b.WriteString("\n" + titleStyle.Render(fmt.Sprintf("Neighbours (%d)", len(m.neighbours))) + "\n")
+	v4, v6 := 0, 0
+	for _, n := range m.neighbours {
+		if n.IPv6 {
+			v6++
+		} else {
+			v4++
+		}
+	}
+	b.WriteString("\n" + titleStyle.Render(fmt.Sprintf("Neighbours (%d)", len(m.neighbours))) +
+		subtleStyle.Render(fmt.Sprintf("   %d IPv4 · %d IPv6", v4, v6)) + "\n")
 	if len(m.neighbours) == 0 {
 		b.WriteString("  " + subtleStyle.Render("none — nothing has been spoken to on the LAN yet") + "\n")
 	} else {
-		b.WriteString("  " + subtleStyle.Render(fmt.Sprintf("%-18s %-19s %-10s %s",
-			"ADDRESS", "MAC", "IFACE", "VENDOR")) + "\n")
+		b.WriteString("  " + subtleStyle.Render(fmt.Sprintf("%-40s %-19s %-10s %-11s %s",
+			"ADDRESS", "MAC", "IFACE", "STATE", "VENDOR")) + "\n")
 	}
 	for _, n := range m.neighbours {
 		mac := n.MAC
@@ -157,11 +169,15 @@ func (m Model) renderRoutesText() string {
 		} else {
 			mac = padRight(mac, 19)
 		}
-		b.WriteString(fmt.Sprintf("  %-18s %s %-10s %s\n",
-			trunc(n.IP, 18), mac, trunc(n.Iface, 10), n.Vendor))
+		state := padRight(trunc(n.State, 11), 11)
+		if n.State == "reachable" || n.State == "permanent" {
+			state = okStyle.Render(state)
+		} else if n.Stale {
+			state = subtleStyle.Render(state)
+		}
+		b.WriteString(fmt.Sprintf("  %-40s %s %-10s %s %s\n",
+			trunc(n.IP, 40), mac, trunc(n.Iface, 10), state, n.Vendor))
 	}
-
-	b.WriteString("\n" + subtleStyle.Render("IPv6 neighbours are not shown: the kernel keeps them in netlink only, not /proc.") + "\n")
 
 	return b.String()
 }
@@ -174,6 +190,11 @@ func (m Model) viewRoutes() string {
 		m.routesVP.SetContent(m.routesText)
 	}
 	head := subtleStyle.Render(fmt.Sprintf("Host network configuration · re-read every %s · ↑↓ scroll", hostStateInterval))
+	if m.remoteLive() {
+		head = subtleStyle.Render("Host network configuration of " + m.remoteHost + " · polled · ↑↓ scroll")
+	} else if m.snapshotOnly {
+		head = subtleStyle.Render("Host network configuration · from the snapshot, frozen · ↑↓ scroll")
+	}
 
 	return boxStyle.Width(routesW).Height(m.bodyHeight()).Render(head + "\n\n" + m.routesVP.View())
 }

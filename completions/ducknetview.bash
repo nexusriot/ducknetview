@@ -4,9 +4,10 @@ _ducknetview() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="--once --json --from --metrics --top --usage --usage-all
-          --check-baseline --baseline --save-baseline --log-events
-          --on-alert --tab --version --help"
+    opts="--once --json --from --diff --metrics --metrics-listen --top
+          --usage --usage-all --daemon --check-baseline --check-config
+          --baseline --save-baseline --log-events --on-alert --tab
+          --version --help"
     tabs="overview interfaces ports processes procs connections conns events routes neighbours"
 
     case "$prev" in
@@ -18,10 +19,18 @@ _ducknetview() {
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
-        --top|--usage)
+        --top|--usage|--metrics-listen)
             return 0
             ;;
     esac
+
+    # --diff takes two snapshot files as positional arguments.
+    for word in "${COMP_WORDS[@]}"; do
+        if [ "$word" = "--diff" ]; then
+            COMPREPLY=( $(compgen -f -- "$cur") )
+            return 0
+        fi
+    done
 
     COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }

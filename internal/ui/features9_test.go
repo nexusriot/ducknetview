@@ -30,22 +30,29 @@ func TestRoutesTabRendersHostConfiguration(t *testing.T) {
 		{Destination: "192.168.1.0/24", Iface: "eth0"},
 	}
 	m.neighbours = []probe.Neighbour{
-		{IP: "192.168.1.1", MAC: "b8:27:eb:11:22:33", Iface: "eth0", Vendor: "Raspberry Pi"},
-		{IP: "192.168.1.9", MAC: "00:00:00:00:00:00", Iface: "eth0", Stale: true},
+		{IP: "192.168.1.1", MAC: "b8:27:eb:11:22:33", Iface: "eth0", Vendor: "Raspberry Pi", State: "reachable"},
+		{IP: "192.168.1.9", MAC: "00:00:00:00:00:00", Iface: "eth0", Stale: true, State: "incomplete"},
+		{IP: "fe80::e21f:2bff:fe51:1c31", MAC: "e0:1f:2b:51:1c:31", Iface: "eth0", IPv6: true, State: "stale"},
 	}
 	m.resolvers = []probe.Resolver{{Address: "127.0.0.53", Stub: true}, {Address: "1.1.1.1"}}
 
 	text := stripANSI(m.renderRoutesText())
 	for _, want := range []string{"Default route", "192.168.1.1 via eth0", "Nameservers",
 		"local stub resolver", "1.1.1.1", "Routes (2)", "192.168.1.0/24", "on-link",
-		"Neighbours (2)", "Raspberry Pi", "incomplete"} {
+		"Neighbours (3)", "Raspberry Pi", "incomplete"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("routes view missing %q:\n%s", want, text)
 		}
 	}
-	// The limitation is stated rather than left as a silent gap.
-	if !strings.Contains(text, "IPv6 neighbours are not shown") {
-		t.Error("the view should say that IPv6 neighbours are not covered")
+	// IPv6 neighbours used to be a documented gap; they come from netlink now,
+	// so the address, its state and the family split all have to be there.
+	for _, want := range []string{"fe80::e21f:2bff:fe51:1c31", "stale", "2 IPv4 · 1 IPv6"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("routes view missing IPv6 neighbour detail %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "IPv6 neighbours are not shown") {
+		t.Error("the view still claims IPv6 neighbours are not covered")
 	}
 
 	if got := stripANSI(m.gatewayLine()); !strings.Contains(got, "192.168.1.1") || !strings.Contains(got, "DNS") {

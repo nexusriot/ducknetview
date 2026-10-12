@@ -18,6 +18,7 @@ type procRow struct {
 	probe.ProcNet
 	members int     // how many processes are folded in
 	pids    []int32 // their PIDs, for summing throughput
+	depth   int     // indentation in the tree view (see proctree.go)
 }
 
 // mixedValue marks a column whose folded members disagree — a name shared by

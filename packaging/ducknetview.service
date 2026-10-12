@@ -1,0 +1,44 @@
+[Unit]
+Description=ducknetview network monitor (headless)
+Documentation=man:ducknetview(1)
+After=network.target
+
+[Service]
+# No elevated privileges: the socket counters come from sock_diag, which the
+# kernel reports to unprivileged callers exactly as it does to ss(8).
+# DynamicUser gives it a private account rather than sharing nobody, and
+# StateDirectory gives that account somewhere to keep its config, baseline,
+# usage history and trend.
+DynamicUser=yes
+StateDirectory=ducknetview
+Environment=XDG_CONFIG_HOME=/var/lib/ducknetview
+
+# Refuse to start rather than running with half the rules quietly disabled.
+ExecStartPre=/usr/bin/ducknetview --check-config
+ExecStart=/usr/bin/ducknetview --daemon \
+    --log-events /var/log/ducknetview/events.jsonl \
+    --metrics-listen 127.0.0.1:9847
+LogsDirectory=ducknetview
+
+# `systemctl reload` re-reads the config in place. A restart would throw away
+# the session totals, the event ring and the rate baselines, which are most of
+# what a long-running daemon accumulates.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# The daemon writes the day's usage totals on the way out, so it must be given
+# the chance to exit rather than being killed outright.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=5
+
+# It only reads /proc and its own state directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

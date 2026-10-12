@@ -61,6 +61,14 @@ type config struct {
 	AlertRetransPerMin float64 `json:"alert_retrans_per_min,omitempty"`
 	AlertConnGrowth    int     `json:"alert_conn_growth_polls,omitempty"`
 	AlertFanoutHosts   int     `json:"alert_fanout_hosts,omitempty"`
+	// Link health: errors and drops per minute on one interface.
+	AlertIfaceDropsPerMin float64 `json:"alert_iface_drops_per_min,omitempty"`
+
+	// Appearance and interaction.
+	Theme       string            `json:"theme,omitempty"`
+	Keys        map[string]string `json:"keys,omitempty"`
+	ASNDatabase string            `json:"asn_database,omitempty"`
+	ProcTree    bool              `json:"process_tree,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -139,11 +147,24 @@ func (m *Model) applyConfig() {
 	m.alertProcBps = maxFloat(0, c.AlertProcessBps)
 	m.alertConnBps = maxFloat(0, c.AlertConnBps)
 	m.alertRules = alertRules{
-		rttMs:         maxFloat(0, c.AlertRTTMs),
-		retransPerMin: maxFloat(0, c.AlertRetransPerMin),
-		connGrowth:    max(0, c.AlertConnGrowth),
-		fanoutHosts:   max(0, c.AlertFanoutHosts),
+		rttMs:            maxFloat(0, c.AlertRTTMs),
+		retransPerMin:    maxFloat(0, c.AlertRetransPerMin),
+		connGrowth:       max(0, c.AlertConnGrowth),
+		fanoutHosts:      max(0, c.AlertFanoutHosts),
+		ifaceDropsPerMin: maxFloat(0, c.AlertIfaceDropsPerMin),
 	}
+
+	// An unknown theme name falls back to the default rather than rendering
+	// everything unstyled.
+	if validTheme(c.Theme) {
+		m.theme = c.Theme
+	}
+	applyTheme(m.theme)
+
+	m.keymap = newKeymap(c.Keys)
+	m.procTree = c.ProcTree
+	m.asnPath = c.ASNDatabase
+	m.loadASNDB()
 
 	if len(c.Baseline) > 0 {
 		set := make(map[string]bool, len(c.Baseline))
@@ -192,10 +213,16 @@ func (m Model) saveConfig() {
 		AlertProcessBps: m.alertProcBps,
 		AlertConnBps:    m.alertConnBps,
 
-		AlertRTTMs:         m.alertRules.rttMs,
-		AlertRetransPerMin: m.alertRules.retransPerMin,
-		AlertConnGrowth:    m.alertRules.connGrowth,
-		AlertFanoutHosts:   m.alertRules.fanoutHosts,
+		AlertRTTMs:            m.alertRules.rttMs,
+		AlertRetransPerMin:    m.alertRules.retransPerMin,
+		AlertConnGrowth:       m.alertRules.connGrowth,
+		AlertFanoutHosts:      m.alertRules.fanoutHosts,
+		AlertIfaceDropsPerMin: m.alertRules.ifaceDropsPerMin,
+
+		Theme:       m.theme,
+		Keys:        m.keymap.overrides(),
+		ASNDatabase: m.asnPath,
+		ProcTree:    m.procTree,
 	}
 	if !m.baselineAt.IsZero() {
 		c.BaselineAt = m.baselineAt.Format(time.RFC3339)

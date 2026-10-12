@@ -10,6 +10,7 @@ import (
 
 type ProcNet struct {
 	PID         int32
+	PPID        int32 // parent, for the process tree ("" relationships are roots)
 	Name        string
 	ConnCount   int
 	ListenCount int
@@ -124,6 +125,13 @@ func EnrichProc(pn *ProcNet) {
 
 	if mp, e := p.MemoryPercent(); e == nil {
 		pn.Mem = mp
+	}
+	// The parent is what makes a tree possible. It is one more read of
+	// /proc/<pid>/stat per process per poll, which is the same file Times()
+	// just read — cheap enough at this list size, and there is no way to get
+	// the relationship without it.
+	if pp, e := p.Ppid(); e == nil {
+		pn.PPID = pp
 	}
 }
 

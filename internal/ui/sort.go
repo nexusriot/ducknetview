@@ -12,7 +12,7 @@ import (
 var (
 	portsSortCols = []string{"proto", "port", "pid", "process", "user"}
 	procsSortCols = []string{"conns", "listen", "cpu", "mem", "rx", "tx", "pid", "name", "user"}
-	connsSortCols = []string{"pid", "proto", "state", "local", "remote", "process", "scope", "age", "rx", "tx", "rtt", "retrans"}
+	connsSortCols = []string{"pid", "proto", "state", "local", "remote", "process", "scope", "age", "rx", "tx", "rtt", "retrans", "owner"}
 	groupSortCols = []string{"conns", "host", "bytes"}
 )
 
@@ -322,6 +322,21 @@ func (m Model) sortConns(rows []probe.Conn) {
 				c = 1
 			default:
 				c = cmpConns(rows[i], rows[j], "pid")
+			}
+			if m.connsSortDesc {
+				c = -c
+			}
+			return c < 0
+		})
+		return
+	}
+	if col == "owner" {
+		// Ownership comes from the loaded table rather than the Conn, and
+		// grouping a session's peers by network is the point of the column.
+		sort.SliceStable(rows, func(i, j int) bool {
+			c := cmpStr(m.ownerOf(rows[i].Remote), m.ownerOf(rows[j].Remote))
+			if c == 0 {
+				c = cmpConns(rows[i], rows[j], "remote")
 			}
 			if m.connsSortDesc {
 				c = -c

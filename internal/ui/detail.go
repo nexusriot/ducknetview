@@ -153,6 +153,9 @@ func (m Model) detailContent() (string, bool) {
 			kv("Local", c.Local)
 			kv("Remote", m.dnsDisplay(c.Remote))
 			kv("Scope", probe.IPScope(stripPort(c.Remote)))
+			if owner := m.ownerDetail(c.Remote); owner != "" {
+				kv("Network", owner)
+			}
 			kv("Service", probe.ServiceName(portOf(c.Remote), c.Proto))
 			kv("Last state", c.State)
 			kv("Opened", timeOrDash(cc.firstSeen))
@@ -183,6 +186,9 @@ func (m Model) detailContent() (string, bool) {
 			b.WriteString(titleStyle.Render("Remote host group") + "\n\n")
 			kv("Host", host)
 			kv("Scope", probe.IPScope(g.ip))
+			if owner := m.ownerDetail(g.ip); owner != "" {
+				kv("Network", owner)
+			}
 			kv("Conns", fmt.Sprintf("%d", g.count))
 			kv("States", formatStates(g.states))
 			kv("Processes", strings.Join(g.procs, ", "))
@@ -203,6 +209,9 @@ func (m Model) detailContent() (string, bool) {
 			kv("Local", c.Local)
 			kv("Remote", m.dnsDisplay(c.Remote))
 			kv("Scope", probe.IPScope(stripPort(c.Remote)))
+			if owner := m.ownerDetail(c.Remote); owner != "" {
+				kv("Network", owner)
+			}
 			if m.isWatched(c.Remote) {
 				kv("Watchlist", "MATCH")
 			}

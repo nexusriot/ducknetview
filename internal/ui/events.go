@@ -86,6 +86,17 @@ func (e event) MarshalJSON() ([]byte, error) {
 // line, rather than repeatedly.
 func (m *Model) recordEvent(e event) {
 	m.events = probe.ClampHistory(append(m.events, e), eventLimit)
+	m.echoEvent(e)
+
+	// Counted rather than derived from the ring, which is capped at 500 and so
+	// forgets most of a long session.
+	if m.eventCounts == nil {
+		m.eventCounts = map[string]int{}
+	}
+	m.eventCounts[e.Kind]++
+	if e.Level == levelAlert {
+		m.alertCount++
+	}
 
 	// Hooks run for alerts only, and are queued for the update loop to launch.
 	if e.Level == levelAlert && m.alertHook != "" {
