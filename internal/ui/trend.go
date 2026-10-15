@@ -138,10 +138,7 @@ func (h trendHistory) save() {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return
-	}
-	_ = os.WriteFile(p, append(b, '\n'), 0o644)
+	_ = writeFileAtomic(p, append(b, '\n'), 0o644)
 }
 
 // recordTrend folds one interface sample into the long history, flushing to

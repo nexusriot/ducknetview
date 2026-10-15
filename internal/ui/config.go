@@ -69,6 +69,10 @@ type config struct {
 	Keys        map[string]string `json:"keys,omitempty"`
 	ASNDatabase string            `json:"asn_database,omitempty"`
 	ProcTree    bool              `json:"process_tree,omitempty"`
+
+	// Named arrangements of the tables (see views.go), saved with the views
+	// overlay and recalled from it or with --view.
+	Views []savedView `json:"views,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -79,30 +83,52 @@ func configPath() (string, error) {
 	return filepath.Join(dir, "ducknetview", "config.json"), nil
 }
 
-// loadConfig reads the persisted config. ok is false when there is no readable,
-// valid config file (first run, unreadable dir, corrupt JSON) — callers should
-// then keep their defaults.
-func loadConfig() (config, bool) {
+// configState says what happened when the config was read. "Missing" and
+// "unreadable" both leave the caller on its defaults, but they are not the same
+// thing: a file that exists and could not be parsed must never be overwritten,
+// because everything in it (the watchlist, the thresholds, the key bindings)
+// would be lost to a single stray comma.
+type configState int
+
+const (
+	configLoaded     configState = iota // read and parsed
+	configMissing                       // no file yet, which is what a first run looks like
+	configUnreadable                    // the file is there but could not be read or parsed
+)
+
+// loadConfig reads the persisted config, reporting whether the defaults in
+// play are because there is nothing to load or because what is there could not
+// be used.
+func loadConfig() (config, configState) {
 	p, err := configPath()
 	if err != nil {
-		return config{}, false
+		return config{}, configMissing
 	}
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return config{}, false
+		if os.IsNotExist(err) {
+			return config{}, configMissing
+		}
+		return config{}, configUnreadable
 	}
 	var c config
 	if json.Unmarshal(b, &c) != nil {
-		return config{}, false
+		return config{}, configUnreadable
 	}
-	return c, true
+	return c, configLoaded
 }
 
 // applyConfig overlays persisted settings onto the model, ignoring anything out
 // of range so a hand-edited or stale file can't wedge the UI.
 func (m *Model) applyConfig() {
-	c, ok := loadConfig()
-	if !ok {
+	c, state := loadConfig()
+	// Latched for the life of the session: a file this process could not read
+	// is a file this process must not write (see saveConfig).
+	m.configUnsafe = state == configUnreadable
+	if state != configLoaded {
+		if m.configUnsafe {
+			m.status = "Config file unreadable — running on defaults, and it will not be overwritten"
+		}
 		return
 	}
 	m.hideNoise = c.HideNoise
@@ -162,6 +188,7 @@ func (m *Model) applyConfig() {
 	applyTheme(m.theme)
 
 	m.keymap = newKeymap(c.Keys)
+	m.views = loadViews(c.Views)
 	m.procTree = c.ProcTree
 	m.asnPath = c.ASNDatabase
 	m.loadASNDB()
@@ -182,6 +209,12 @@ func (m *Model) applyConfig() {
 // saveConfig writes the current persisted settings, best-effort (errors are
 // swallowed: a monitoring tool must never fail to quit because of config I/O).
 func (m Model) saveConfig() {
+	// Refusing to write is the whole point: the alternative is replacing a
+	// config we never managed to parse with this session's defaults, which
+	// silently deletes every hand-written setting in it.
+	if m.configUnsafe {
+		return
+	}
 	c := config{
 		HideNoise:      m.hideNoise,
 		RefreshMs:      int(m.refreshInterval / time.Millisecond),
@@ -223,6 +256,7 @@ func (m Model) saveConfig() {
 		Keys:        m.keymap.overrides(),
 		ASNDatabase: m.asnPath,
 		ProcTree:    m.procTree,
+		Views:       m.views,
 	}
 	if !m.baselineAt.IsZero() {
 		c.BaselineAt = m.baselineAt.Format(time.RFC3339)
@@ -237,14 +271,46 @@ func (m Model) saveConfig() {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return
-	}
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(p, b, 0o644)
+	_ = writeFileAtomic(p, b, 0o644)
+}
+
+// writeFileAtomic writes through a temporary file in the same directory and
+// renames it into place. The config is rewritten on nearly every keypress, so
+// a crash or a full disk part-way through a plain write would leave a
+// truncated file — which the next run cannot parse, and which it then has to
+// refuse to touch.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once the rename has succeeded
+
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // maxFloat clamps a hand-edited config value, so a negative threshold can't

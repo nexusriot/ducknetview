@@ -24,7 +24,23 @@ const (
 	// alertHookTimeout bounds an external hook, so a hanging script cannot
 	// accumulate processes for the life of the session.
 	alertHookTimeout = 10 * time.Second
+	// alertClearAfter is how long a subject must stay under its threshold
+	// before the recovery is announced. A rate sitting on the threshold would
+	// otherwise alternate "over" and "back to normal" every poll.
+	alertClearAfter = 60 * time.Second
 )
+
+// firingAlert is a rule that is currently breaching for one subject, kept so
+// that the tool can say when it stops. Every rule here fires and then goes
+// quiet; nothing ever said the condition had passed, so a pager driven by
+// --on-alert was paged and never cleared, and the event log recorded a
+// beginning with no end.
+type firingAlert struct {
+	kind    string
+	subject string
+	since   time.Time // first poll at which it was over the threshold
+	last    time.Time // most recent poll at which it still was
+}
 
 // alertHookResultMsg reports a failed hook invocation.
 type alertHookResultMsg struct {
@@ -58,7 +74,9 @@ func (m *Model) noteThroughputAlerts(conns []probe.Conn, now time.Time) {
 			if subject == "" {
 				subject = fmt.Sprintf("pid %d", pid)
 			}
-			if m.shouldFire("proc:"+subject, now) {
+			key := "proc:" + subject
+			m.noteBreach(key, "throughput_process", subject, now)
+			if m.shouldFire(key, now) {
 				rec.add(levelAlert, "throughput_process", subject,
 					fmt.Sprintf("%s over threshold %s",
 						probe.HumanBytesPerSec(total), probe.HumanBytesPerSec(m.alertProcBps)))
@@ -74,7 +92,9 @@ func (m *Model) noteThroughputAlerts(conns []probe.Conn, now time.Time) {
 				continue
 			}
 			subject := c.Local + " → " + m.dnsDisplay(c.Remote)
-			if m.shouldFire("conn:"+subject, now) {
+			key := "conn:" + subject
+			m.noteBreach(key, "throughput_connection", subject, now)
+			if m.shouldFire(key, now) {
 				rec.add(levelAlert, "throughput_connection", subject,
 					joinNonEmpty(fmt.Sprintf("%s over threshold %s",
 						probe.HumanBytesPerSec(total), probe.HumanBytesPerSec(m.alertConnBps)),
@@ -94,6 +114,49 @@ func (m *Model) shouldFire(subject string, now time.Time) bool {
 	}
 	m.alertFired[subject] = now
 	return true
+}
+
+// noteBreach records that a subject is over its threshold right now. It is
+// separate from shouldFire because the re-fire suppression must not make a
+// condition that is still breaching look like one that has recovered.
+//
+// Only the sustained rules call it: a fan-out burst or a connection leak is a
+// moment rather than a state, and "the scan has stopped" is not something one
+// poll can know.
+func (m *Model) noteBreach(key, kind, subject string, now time.Time) {
+	if m.alertActive == nil {
+		m.alertActive = map[string]*firingAlert{}
+	}
+	if a, ok := m.alertActive[key]; ok {
+		a.last = now
+		return
+	}
+	m.alertActive[key] = &firingAlert{kind: kind, subject: subject, since: now, last: now}
+}
+
+// noteAlertRecoveries announces the rules that have stopped breaching. It runs
+// once per socket poll rather than inside each rule, because a subject that
+// has gone away entirely — the transfer finished, the process exited — is
+// exactly the recovery worth hearing about, and no rule looks at it any more.
+func (m *Model) noteAlertRecoveries(now time.Time) {
+	if len(m.alertActive) == 0 {
+		return
+	}
+
+	rec := m.newEventRecorder(now)
+	defer rec.flush()
+
+	for key, a := range m.alertActive {
+		if now.Sub(a.last) < alertClearAfter {
+			continue
+		}
+		rec.add(levelInfo, a.kind+"_cleared", a.subject,
+			"back under the threshold after "+formatDuration(a.last.Sub(a.since)))
+		delete(m.alertActive, key)
+		// The suppression entry is what would keep the next breach quiet, and a
+		// condition announced as over should alert again the moment it returns.
+		delete(m.alertFired, key)
+	}
 }
 
 // pruneAlertHistory drops suppression entries that can no longer suppress
@@ -200,7 +263,9 @@ func (m *Model) noteQualityAlerts(conns []probe.Conn, now time.Time) {
 		if m.alertRules.rttMs > 0 && c.RTT > 0 {
 			if ms := float64(c.RTT) / float64(time.Millisecond); ms >= m.alertRules.rttMs {
 				subject := c.Local + " → " + m.dnsDisplay(c.Remote)
-				if m.shouldFire("rtt:"+subject, now) {
+				key := "rtt:" + subject
+				m.noteBreach(key, "latency", subject, now)
+				if m.shouldFire(key, now) {
 					rec.add(levelWarn, "latency", subject,
 						joinNonEmpty(fmt.Sprintf("RTT %s over threshold %.0fms", c.RTT.Round(time.Millisecond), m.alertRules.rttMs),
 							procLabel(c.PID, c.Process)))
@@ -214,7 +279,9 @@ func (m *Model) noteQualityAlerts(conns []probe.Conn, now time.Time) {
 					perMin := delta / dt * 60
 					if perMin >= m.alertRules.retransPerMin {
 						subject := c.Local + " → " + m.dnsDisplay(c.Remote)
-						if m.shouldFire("retrans:"+subject, now) {
+						rkey := "retrans:" + subject
+						m.noteBreach(rkey, "packet_loss", subject, now)
+						if m.shouldFire(rkey, now) {
 							rec.add(levelWarn, "packet_loss", subject,
 								joinNonEmpty(fmt.Sprintf("%.0f retransmits/min over threshold %.0f", perMin, m.alertRules.retransPerMin),
 									procLabel(c.PID, c.Process)))
@@ -343,7 +410,9 @@ func (m *Model) noteIfaceAlerts(snap probe.NetSnapshot) {
 		if perMin < m.alertRules.ifaceDropsPerMin {
 			continue
 		}
-		if m.shouldFire("iface:"+ii.Name, now) {
+		key := "iface:" + ii.Name
+		m.noteBreach(key, "link_errors", ii.Name, now)
+		if m.shouldFire(key, now) {
 			rec.add(levelWarn, "link_errors", ii.Name,
 				fmt.Sprintf("%.0f errors+drops/min over threshold %.0f",
 					perMin, m.alertRules.ifaceDropsPerMin))

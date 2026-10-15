@@ -161,6 +161,14 @@ in its environment. It is executed directly, never through a shell.
 Open on a particular tab: overview, interfaces, ports, processes, connections,
 events or routes.
 .TP
+.BI \-\-view " name"
+Open in a saved view: the whole arrangement of the tables — tab, sort, search,
+quick filters and toggles — under a name, as saved from the
+.B V
+overlay. With an unknown name the saved names are listed. Applied before
+.BR \-\-tab ,
+so the two compose.
+.TP
 .B \-\-version
 Print the version and exit.
 .TP
@@ -218,6 +226,18 @@ folds rows sharing a name instead; the two are exclusive.
 Open the settings overlay: the alert thresholds, the latency targets, the
 hidden columns and the theme, all of which previously had to be hand-edited in
 the config file. Changes are written out as they are made.
+.TP
+.B V
+Open the views overlay: named arrangements of the tables.
+.B enter
+applies the highlighted one,
+.B n
+saves the current screen under a name,
+.B d
+deletes one. A view records the tab, the per-tab searches, every sort column
+and direction, the quick filters and the view toggles — everything it takes to
+get back to a particular question. It does not record a drill, which points at
+PIDs that will not exist next time.
 .TP
 .B x
 Signal the highlighted row's process, confirming with
@@ -310,6 +330,12 @@ actually bound.
 .TP
 .B process_tree
 Whether the Processes tab opens as a tree.
+.TP
+.B views
+The saved views, as written by the
+.B V
+overlay. A view with no name, a duplicate name, or one past the thirty-second
+is dropped.
 .SH ENVIRONMENT
 .TP
 .B NO_COLOR

@@ -47,8 +47,16 @@ func TestHelpToggle(t *testing.T) {
 		t.Fatal("? should open the help overlay")
 	}
 
-	// Any key closes it again.
+	// The overlay is longer than a terminal, so the scroll keys scroll it
+	// rather than closing it — the same contract the detail overlay has.
 	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	m = model.(Model)
+	if !m.showHelp {
+		t.Fatal("a scroll key should scroll the help overlay, not close it")
+	}
+
+	// Any other key closes it again.
+	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
 	m = model.(Model)
 	if m.showHelp {
 		t.Fatal("a keypress should close the help overlay")

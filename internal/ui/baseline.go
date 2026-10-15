@@ -86,8 +86,8 @@ func (m Model) offBaselineCount() int {
 // no baseline has been saved, which callers report as a usage error rather
 // than as "nothing unexpected".
 func BaselineCheck(ports []probe.ListenPort) (offending []probe.ListenPort, savedAt time.Time, ok bool) {
-	c, loaded := loadConfig()
-	if !loaded || len(c.Baseline) == 0 {
+	c, state := loadConfig()
+	if state != configLoaded || len(c.Baseline) == 0 {
 		return nil, time.Time{}, false
 	}
 	if t, err := time.Parse(time.RFC3339, c.BaselineAt); err == nil {
@@ -145,7 +145,7 @@ func SaveBaselineFile(path, host string, ports []probe.ListenPort) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(path, append(b, '\n'), 0o644); err != nil {
 		return 0, err
 	}
 	return len(keys), nil

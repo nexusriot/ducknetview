@@ -18,6 +18,11 @@ type ProcNet struct {
 	Container   string  // short container id, "" when not containerised
 	CPU         float64 // percent of one core, measured since the previous poll
 	Mem         float32 // percent of physical memory (RSS)
+
+	// The full command line, which is the only thing that separates forty rows
+	// called "python3" from each other. Deliberately not serialised: a command
+	// line can carry a password or a token, and a snapshot gets piped around.
+	Cmdline string `json:"-"`
 }
 
 // ProcDetail holds the extra, comparatively expensive process attributes shown
@@ -125,6 +130,13 @@ func EnrichProc(pn *ProcNet) {
 
 	if mp, e := p.MemoryPercent(); e == nil {
 		pn.Mem = mp
+	}
+	// The command line is what makes the Processes search useful: a name tells
+	// you it is python, the arguments tell you which script. One more read of
+	// /proc/<pid>/cmdline per displayed process per poll, and the list is
+	// bounded by procLimit.
+	if cl, e := p.Cmdline(); e == nil {
+		pn.Cmdline = cl
 	}
 	// The parent is what makes a tree possible. It is one more read of
 	// /proc/<pid>/stat per process per poll, which is the same file Times()

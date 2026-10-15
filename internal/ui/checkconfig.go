@@ -75,8 +75,18 @@ func configKeys() map[string]bool {
 }
 
 // CheckConfig validates the saved configuration and reports everything wrong
-// with it at once.
-func CheckConfig() ConfigReport {
+// with it at once. It resolves latency targets and loads the ASN table, so it
+// belongs on the command line rather than anywhere latency matters.
+func CheckConfig() ConfigReport { return checkConfig(true) }
+
+// CheckConfigFast is the same check with the parts that touch the network or
+// read a large file left out. A live reload runs on the update loop, where a
+// DNS lookup for an unresolvable target stalls polling for as long as the
+// resolver takes, and re-reading a half-million-row ASN table does it again
+// for the table the reload is about to load anyway.
+func CheckConfigFast() ConfigReport { return checkConfig(false) }
+
+func checkConfig(deep bool) ConfigReport {
 	r := ConfigReport{}
 
 	p, err := configPath()
@@ -135,9 +145,9 @@ func CheckConfig() ConfigReport {
 	}
 
 	checkRanges(&c, raw, add)
-	checkLists(&c, add)
+	checkLists(&c, add, deep)
 	checkAlerts(&c, add)
-	checkAppearance(&c, add)
+	checkAppearance(&c, add, deep)
 
 	return r
 }
@@ -184,7 +194,7 @@ func checkRanges(c *config, raw map[string]json.RawMessage, add func(key, value,
 }
 
 // checkLists reports entries of the array-valued keys that are quietly dropped.
-func checkLists(c *config, add func(key, value, detail string)) {
+func checkLists(c *config, add func(key, value, detail string), deep bool) {
 	for _, key := range c.HiddenColumns {
 		k := strings.ToLower(strings.TrimSpace(key))
 		if k == "" {
@@ -208,7 +218,7 @@ func checkLists(c *config, add func(key, value, detail string)) {
 		// A host that does not resolve is worth saying, but is not an error:
 		// DNS may simply be down at the moment the check runs.
 		host, _, _ := net.SplitHostPort(t)
-		if net.ParseIP(host) == nil {
+		if deep && net.ParseIP(host) == nil {
 			if _, err := net.LookupHost(host); err != nil {
 				add("latency_targets", target,
 					"the host does not resolve right now, so the probe will report no response")
@@ -231,6 +241,25 @@ func checkLists(c *config, add func(key, value, detail string)) {
 		if _, err := regexp.Compile(e); err != nil {
 			add("watchlist", entry,
 				"not a CIDR, not an IP and not a valid regular expression ("+err.Error()+"), so it matches nothing")
+		}
+	}
+
+	seenViews := map[string]bool{}
+	for i, v := range c.Views {
+		name := strings.TrimSpace(v.Name)
+		switch {
+		case name == "":
+			add("views", fmt.Sprintf("#%d", i+1), "a view with no name can never be recalled, so it is dropped")
+			continue
+		case seenViews[strings.ToLower(name)]:
+			add("views", name, "a view of this name is already listed, so this one is dropped")
+			continue
+		case i >= maxSavedViews:
+			add("views", name, fmt.Sprintf("past the limit of %d views, so it is dropped", maxSavedViews))
+		}
+		seenViews[strings.ToLower(name)] = true
+		if v.Tab < 0 || v.Tab > tabCount-1 {
+			add("views", name, fmt.Sprintf("tab %d is out of range 0–%d, so it is clamped", v.Tab, tabCount-1))
 		}
 	}
 
@@ -269,7 +298,7 @@ func checkAlerts(c *config, add func(key, value, detail string)) {
 
 // checkAppearance reports a theme, a key binding or a database that will not
 // take effect.
-func checkAppearance(c *config, add func(key, value, detail string)) {
+func checkAppearance(c *config, add func(key, value, detail string), deep bool) {
 	if c.Theme != "" && !validTheme(c.Theme) {
 		add("theme", c.Theme, "not a known theme, so the default is used — try "+strings.Join(ThemeNames(), ", "))
 	}
@@ -304,7 +333,7 @@ func checkAppearance(c *config, add func(key, value, detail string)) {
 		}
 	}
 
-	if c.ASNDatabase != "" {
+	if deep && c.ASNDatabase != "" {
 		if _, err := probe.LoadASNDB(c.ASNDatabase); err != nil {
 			add("asn_database", c.ASNDatabase,
 				"cannot be loaded, so the OWNER column will not appear: "+err.Error())
@@ -357,7 +386,7 @@ func (m *Model) reloadConfig() {
 		return
 	}
 
-	report := CheckConfig()
+	report := CheckConfigFast()
 	m.applyConfig()
 	m.rerenderActiveTable()
 

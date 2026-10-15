@@ -28,8 +28,8 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - Hostname, uptime, current timestamp
     - Interface count (up / down) and the active refresh interval
     - **Security summary** — at-a-glance counts of exposed listeners, public connections, watchlist hits and listeners outside the saved baseline
-    - **Gateway and DNS** — the default route in use and the nameservers configured, on one line
-    - **Path latency** — TCP-handshake round trip to the default gateway (and any extra targets in the config), with a short history each
+    - **Gateway and DNS** — the default route in use and the nameservers configured, on one line. An IPv6-only host has an IPv6 default route and is reported as such, rather than being told it cannot reach anything off-link
+    - **Path latency** — TCP-handshake round trip to the default gateway (and any extra targets in the config), with a short history each. A dual-stack host gets both first hops, as `gateway` and `gateway6`: they are frequently not the same box. A link-local IPv6 next hop is probed with its zone (`fe80::1%eth0`), without which it is not dialable at all
     - **Top talkers (session)** — the processes and remote hosts that have moved the most data since launch, with the session grand total
     - **Connection churn** — connections opened and closed per poll, as a chart. A spike is how a leak or a scan announces itself
     - **Last 24 hours** — per-minute throughput peaks kept on disk, so "when did that spike happen" is still answerable after a restart. Every other chart in the tool dies with the session
@@ -71,7 +71,8 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - **`T` arranges the rows as a tree** of what started what, which answers the question `A` cannot: a stray `curl`, a worker under its supervisor, a shell under a session. A process whose parent holds no sockets is a root rather than a hidden row, so nothing disappears
     - **`F` follows the highlighted process into its connections** — you can see it moving 40 MB/s, and this is where to. A folded row follows every PID it stands for
     - **Sortable** (`s` cycles `conns → listen → cpu → mem → rx → tx → pid → name → user`, `S` reverses)
-    - Search (`/`) by process name, PID, user or container id — searching a container id doubles as a per-container filter
+    - Search (`/`) by process name, **command line**, PID, user or container id — the command line is what separates forty rows called `python3`, and searching a container id doubles as a per-container filter. The command line is shown in the row detail overlay and is deliberately never serialised: a `--json` snapshot gets piped around, and an argument list can carry a password
+    - Unprivileged, sockets belonging to other users arrive with no PID at all and cannot be named or signalled. The tab says how many rather than leaving a column of dashes to look like a bug, and the count is recorded once per session as an `attribution_limited` event so a headless log explains its own gaps
 
 - **Connections tab**
     - All active (non-listening) TCP/UDP connections
@@ -104,6 +105,7 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - `/` searches the log and `l` cycles a level filter (all / warn and above / alerts only)
     - **Thresholds and rules**, all opt-in through the config, each firing at most once a minute per subject: throughput per process or per connection (`alert_process_bps`, `alert_connection_bps`), round-trip time (`alert_rtt_ms`), retransmits per minute on one socket (`alert_retrans_per_min`), a process whose connection count only ever grows (`alert_conn_growth_polls` — a leak), a process reaching many new hosts at once (`alert_fanout_hosts` — what a scan looks like from the inside), and errors or drops on a link (`alert_iface_drops_per_min`, measured as a rate because the counters are cumulative since boot). With `--on-alert` each alert also runs a command of your choosing
     - **`listener_moved`** — a service that disappears and reappears on the same port under the same process is reported as one event rather than two, and as an **alert** when the move widens its exposure (`127.0.0.1:5432` → `0.0.0.0:5432` is the case worth catching)
+    - **Recovery is reported too**: every sustained rule — throughput, round-trip time, retransmits, link errors — raises a matching `*_cleared` event once its subject has been back under the threshold for a minute, including when the subject went away entirely because the transfer finished or the process exited. Without it a hook is paged and never cleared, and the log records a beginning with no end
     - `d` acknowledges alerts: the tab badge clears without destroying the log
     - Holds the most recent 500 events in memory; `c` clears them, `e` exports them to CSV, and `--log-events` writes every event to a file as it happens
     - One poll can contribute at most 20 events per kind, with an explicit "N more … suppressed" entry so truncation is never silent
@@ -121,7 +123,7 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - `ducknetview --once` prints a one-shot text snapshot (interfaces, ports, connections) and exits; `--json` emits a fuller snapshot (also including processes, routes, neighbours, resolvers, Wi-Fi and one gateway latency probe) as JSON for scripting
     - `ducknetview --check-baseline` compares the host's listeners against the saved baseline and exits **1** if any are unexpected (**0** when clean, **2** when no baseline has been saved) — enough for cron or a monitoring check
     - `ducknetview --save-baseline FILE` writes a **portable baseline**; `--check-baseline --baseline FILE` checks against it. Build one on a known-good host and ship it to the fleet
-    - `ducknetview --tab conns` opens straight onto a tab
+    - `ducknetview --tab conns` opens straight onto a tab; `ducknetview --view vpn` opens into a saved view (below), and the two compose
     - `ducknetview --from snap.json` browses a `--json` snapshot instead of the live host, frozen and clearly marked. `-` reads stdin, so `ssh host ducknetview --json | ducknetview --from -` browses a remote host with no agent to install. Because the snapshot now carries the host's routing configuration, the Routes tab describes the remote machine rather than explaining why it cannot
     - **`ducknetview --from ssh://host` is the live version of that**: the same command is re-run on the refresh interval, and since two consecutive snapshots carry the same cumulative counters a local poll would, throughput, session totals, the event log and every alert rule work on the far host. Still nothing installed there but the binary. A failed fetch leaves the last view in place and marks the header stale rather than ending the session
     - `ducknetview --metrics` prints the host's network state in Prometheus text format, for a node_exporter textfile directory
@@ -138,8 +140,14 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - Each session's totals are merged into `usage.json` on exit, per day, keeping 40 days and the 50 biggest processes and hosts per day — enough to answer "where did this month's data go" without keeping a database
 
 - **Search**
+    - On the Processes tab the search covers the **command line** as well as the name, which is the only thing separating forty rows called `python3` from each other. It is never written to a snapshot, a CSV or the event log: a command line can carry a password, and a `--json` snapshot gets piped around
     - `/` filters the table; prefix the query with `re:` to use a **regular expression** (case-insensitive, and an invalid one says so instead of silently matching nothing)
     - `\` switches between **filtering** (hide non-matching rows) and **highlighting** (keep every row, mark the matches), and `n` / `N` walk the cursor between matches
+
+- **Saved views (`V`)**
+    - Half the keys in the tool exist to narrow what is on screen. Getting back to "the established TLS connections leaving over the VPN, busiest first" meant pressing six of them in the right order, every session
+    - A view is the whole arrangement under a name: the tab, every per-tab search and the search mode, every sort column and direction, the five quick filters, the interface filter, the event level, and the grouping / closed / totals / name-folding / tree / hide-noise / reverse-DNS toggles. `enter` applies one, `n` saves the current screen, `d` deletes one, and saving under an existing name replaces it
+    - They live in the config, so `ducknetview --view vpn` opens straight into one from a shell alias or a unit file. A drill is deliberately not recorded: it points at PIDs that will not exist next time
 
 - **Settings overlay (`,`)**
     - The six alert thresholds, the latency targets, the hidden columns and the theme had no key binding at all: the only way to discover them was to read this file, and the only way to set one was to quit, edit JSON and start again. The overlay edits all of them in place and writes the config as it goes
@@ -147,10 +155,10 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
 
 - **Themes and key bindings**
     - `theme` selects `default`, `contrast` (for a light terminal or a projector, where the greys that carry most of the dimming are illegible) or `mono`. `NO_COLOR` still overrides all of them
-    - `keys` rebinds any of the 38 actions: `"closed": "Z"`. An unknown action, a reserved key (`ctrl+c`, `tab`, the arrows, the digits) or a key another action already owns is ignored rather than obeyed, so a bad config cannot leave the tool unusable — and the help overlay renders what is actually bound
+    - `keys` rebinds any of the 39 actions: `"closed": "Z"`. An unknown action, a reserved key (`ctrl+c`, `tab`, the arrows, the digits) or a key another action already owns is ignored rather than obeyed, so a bad config cannot leave the tool unusable — and the help overlay renders what is actually bound
 
 - **Persisted settings**
-    - Sort keys/direction, the hide-noise / reverse-DNS / grouping / totals / tree toggles, the quick filters, the search mode, the refresh interval, the last open tab, the theme, the key bindings and the listener baseline are saved to `${XDG_CONFIG_HOME:-~/.config}/ducknetview/config.json` as you change them and restored on next launch
+    - Sort keys/direction, the hide-noise / reverse-DNS / grouping / totals / tree toggles, the quick filters, the search mode, the refresh interval, the last open tab, the theme, the key bindings, the saved views and the listener baseline are saved to `${XDG_CONFIG_HOME:-~/.config}/ducknetview/config.json` as you change them and restored on next launch
 
 Interface counters are sampled on the chosen interval (default every second). The ports, processes and connections views are all derived from a **single socket enumeration** (one `gopsutil` pass feeds all three, with shared process-name, user and container caches). Enumeration follows the chosen refresh interval but never runs more often than every 2 seconds, since it costs roughly twenty times an interface sample.
 
@@ -166,8 +174,9 @@ Press `?` at any time for an in-app key-binding overlay. The mouse is supported 
 
 | Key                  | Action |
 |----------------------|--------|
-| `?`                  | Toggle the help overlay (any key closes it) |
+| `?`                  | Toggle the help overlay (`↑↓` scrolls it — it is longer than a terminal — any other key closes it) |
 | `,`                  | Settings: alert thresholds, latency targets, hidden columns, theme |
+| `V`                  | Views: apply a saved arrangement, `n` saves the current one, `d` deletes |
 | `←` `→`              | Switch tabs |
 | `tab` / `shift+tab`  | Cycle tabs |
 | `1`–`7`              | Jump directly to a tab |
@@ -342,6 +351,23 @@ arguments, plus `DNV_EVENT_*` environment variables):
 ./ducknetview --on-alert /usr/local/bin/notify-ops
 ```
 
+### Tests
+
+```bash
+make test     # unit tests
+make cover    # unit tests with a coverage summary
+make e2e      # the end-to-end suite, in its own container
+```
+
+The unit tests cover the model, the parsers and the renderers against fixed
+input. Everything else — the netlink readers, every non-interactive mode, the
+daemon, the exporter and the TUI itself — needs a live host, so the e2e suite
+**runs inside a container and treats that container as the host under test**:
+it opens known sockets, moves a known number of bytes across them and asserts
+that the program reports them, then drives the TUI on a real pseudo-terminal.
+Nothing on your machine is read or written, and nothing leaves the container.
+See [e2e/README.md](e2e/README.md).
+
 ### Debian package
 
 Two helper scripts are included for producing `.deb` packages:
@@ -396,6 +422,7 @@ back to the default, so an old or hand-mangled file can't wedge the UI.
 | `rates_in_bits` | bool | `U` | Word rates in bits/s instead of bytes/s |
 | `hidden_columns` | []string | `,` | Column keys to leave out of the tables (see below) |
 | `latency_targets` | []string | `,` | Extra `host:port` latency probes; the default gateway is always probed |
+| `views` | []object | `V` | Saved arrangements of the tables, recalled from the overlay or with `--view` |
 | `theme` | string | `,` | `default`, `contrast` or `mono` |
 | `keys` | map | hand-edited | Action name → key, e.g. `{"closed": "Z"}` (see below) |
 | `asn_database` | string | hand-edited | Path to an ip2asn TSV; adds the OWNER column (see below) |
@@ -549,9 +576,18 @@ hook or an alert rule matches on.
 | `conn_growth` | warn | `alert_conn_growth_polls` consecutive polls of growth — a leak |
 | `fanout` | **alert** | `alert_fanout_hosts` new remotes in one poll — a scan |
 | `config_reloaded` | info, warn when part was ignored | `SIGHUP` re-read the config |
+| `attribution_limited` | info | Sockets owned by another user have no PID, so rows cannot be named or signalled. Once per session, and never for root |
+| `link_errors_cleared` | info | The link has been under `alert_iface_drops_per_min` for a minute |
+| `throughput_process_cleared` | info | The process has been under `alert_process_bps` for a minute |
+| `throughput_connection_cleared` | info | The connection has been under `alert_connection_bps` for a minute — including because it closed |
+| `latency_cleared` | info | The connection has been under `alert_rtt_ms` for a minute |
+| `packet_loss_cleared` | info | The socket has been under `alert_retrans_per_min` for a minute |
 
 Only alert-level events run `--on-alert`, and only they count toward the tab
-badge and `ducknetview_alerts_total`.
+badge and `ducknetview_alerts_total`. The `_cleared` kinds are deliberately
+info-level: they are what a pager needs to resolve an incident, not a new one.
+`fanout` and `conn_growth` have no `_cleared` counterpart — a burst is a moment
+rather than a state, and no single poll can know that a scan has stopped.
 
 ---
 
@@ -575,9 +611,11 @@ internal/ui/       - Bubble Tea model, views, styles & themes, sparklines, rever
                      and session metrics, daily usage history, snapshot viewer & diff,
                      headless mode, live remote sessions, config + its validation
 internal/version/  - the single source of truth for the version number
+e2e/               - the end-to-end suite and the container it runs in: the program
+                     against a real host whose sockets the test controls
 man/               - the manual page
 completions/       - bash and zsh completions
-.github/workflows/ - CI: fmt, vet, race tests, cross-compile, staticcheck, .deb
+.github/workflows/ - CI: fmt, vet, race tests, cross-compile, staticcheck, e2e, .deb
 resources/         - screenshots
 DEBIAN/            - control files for the .deb package
 packaging/         - the systemd unit shipped with the .deb
@@ -607,7 +645,7 @@ ROADMAP.md         - the feature backlog, in priority tiers
 - **Session totals** are accumulated from the per-poll deltas, so they cover what happened while the tool was watching — not the whole life of a socket that predates it. The per-host and per-process tables are capped at 2048 entries, evicting the quietest first.
 - **Closed connections** keep the socket's final counters, which *are* its lifetime totals. The last 200 are retained; signalling from a closed row is deliberately disabled, since the PID may already have been recycled onto an unrelated process.
 - The **event log** records *changes*, so the first poll after startup establishes a baseline rather than reporting every existing listener and interface as new. It keeps its last 500 entries in memory; use `--log-events` for anything that needs to outlive the session. That file is rotated at 8 MiB, keeping one previous generation as `.1`.
-- **Latency probes** measure a TCP handshake, counting a refused connection as a valid timing (the RST travelled the same path a SYN-ACK would have). Only the default gateway is probed by default, so nothing leaves the LAN unless `latency_targets` says so. A `--json` snapshot carries one such probe, measured while the sampler is already waiting out its second, so it costs no extra time.
+- **Latency probes** measure a TCP handshake, counting a refused connection as a valid timing (the RST travelled the same path a SYN-ACK would have). Only the default gateways are probed by default (one per address family), so nothing leaves the LAN unless `latency_targets` says so. A `--json` snapshot carries one such probe, measured while the sampler is already waiting out its second, so it costs no extra time.
 - **`--daemon`** runs the same model under Bubble Tea with no renderer and no input attached, so there is one implementation of the polling, the rates and the rules rather than two. It takes the ordinary exit path on `SIGINT`/`SIGTERM`, which is what writes the day's usage totals — a hard stop would lose them.
 - **`--from ssh://host`** executes `ssh -o BatchMode=yes HOST ducknetview --json` directly, never through a shell, and the arguments are a fixed template rather than anything taken from the target, so a host name cannot smuggle in options. One fetch is bounded at 20 seconds and a second is never started behind a slow one. `BatchMode` means it will not sit waiting for a password; set up a key or an agent first.
 - **The 24-hour trend** records the *peak* of each minute rather than the mean: a ten-second burst averaged over sixty seconds looks like nothing. Gaps render as gaps rather than being compressed away, so a restart does not silently rewrite the time axis. A snapshot or a remote session never writes to it — those are another machine's numbers.

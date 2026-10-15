@@ -214,9 +214,9 @@ func TestTogglePersistsImmediately(t *testing.T) {
 		t.Fatal("'g' should enable grouping")
 	}
 
-	c, ok := loadConfig()
-	if !ok || !c.ConnsGroup {
-		t.Fatalf("group toggle should persist immediately: ok=%v conns_group=%v", ok, c.ConnsGroup)
+	c, state := loadConfig()
+	if state != configLoaded || !c.ConnsGroup {
+		t.Fatalf("group toggle should persist immediately: state=%v conns_group=%v", state, c.ConnsGroup)
 	}
 }
 

@@ -78,6 +78,18 @@ jobs:
           go-version: "1.24"
       - run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
 
+  e2e:
+    name: e2e (dockerized)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The suite is the program against a real host: its own container, whose
+      # network namespace it controls. Nothing here is mocked, so this is the
+      # only job that exercises the netlink readers, every non-interactive
+      # mode, the daemon and the TUI on a terminal.
+      - name: Run the e2e suite
+        run: ./e2e/run.sh
+
   deb:
     name: debian packages
     runs-on: ubuntu-latest

@@ -19,5 +19,6 @@ _arguments -s \
   '--log-events[append events to a file as JSON lines]:log file:_files' \
   '--on-alert[run a command for each alert]:command:_command_names -e' \
   '--tab[tab to open on start]:tab:(overview interfaces ports processes procs connections conns events routes neighbours)' \
+  '--view[saved view to open on start]:view:' \
   '--version[print the version and exit]' \
   '--help[print the option list and exit]'

@@ -39,6 +39,7 @@ func main() {
 	logEvents := flag.String("log-events", "", "append events (new listeners, watchlist hits, interface changes) to a file as JSON lines")
 	onAlert := flag.String("on-alert", "", "command to run for each alert-level event (receives kind, subject and detail as arguments)")
 	startTab := flag.String("tab", "", "tab to open on start: "+strings.Join(ui.TabNames(), ", "))
+	startView := flag.String("view", "", "saved view to open on start (see the V overlay)")
 	fromFile := flag.String("from", "", "browse a --json snapshot instead of the live host (\"-\" reads stdin); ssh://[user@]host polls that host live")
 	metrics := flag.Bool("metrics", false, "print the host's network state in Prometheus text format and exit")
 	top := flag.Int("top", 0, "print the N busiest processes and hosts and exit")
@@ -148,6 +149,18 @@ func main() {
 	}
 	if *onAlert != "" {
 		m = m.WithAlertHook(*onAlert)
+	}
+	// Applied before --tab, so the two compose: a view sets the whole
+	// arrangement and --tab then says which part of it to look at first.
+	if *startView != "" {
+		var ok bool
+		if m, ok = m.WithView(*startView); !ok {
+			names := ui.ViewNames()
+			if len(names) == 0 {
+				log.Fatalf("no views are saved — set the screen up and press V to save one")
+			}
+			log.Fatalf("unknown view %q (saved: %s)", *startView, strings.Join(names, ", "))
+		}
 	}
 	if *startTab != "" {
 		var ok bool

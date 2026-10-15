@@ -166,3 +166,29 @@ func TestNeighboursNetlinkLive(t *testing.T) {
 	}
 	t.Logf("parsed %d neighbours from the live cache", len(out))
 }
+
+// The state is shown as `ip neigh` words it, so what the tool says can be
+// checked against that command. The order matters: an entry can be in several
+// states at once and the most informative one has to win.
+func TestNeighStateName(t *testing.T) {
+	cases := []struct {
+		state uint16
+		want  string
+	}{
+		{nudReachable, "reachable"},
+		{nudPermanent, "permanent"},
+		{nudStale, "stale"},
+		{nudDelay, "delay"},
+		{nudProbe, "probe"},
+		{nudFailed, "failed"},
+		{nudIncomplete, "incomplete"},
+		{0, ""},
+		// Reachable wins over stale: it is the more useful of the two.
+		{nudReachable | nudStale, "reachable"},
+	}
+	for _, c := range cases {
+		if got := neighStateName(c.state); got != c.want {
+			t.Errorf("neighStateName(%#x) = %q, want %q", c.state, got, c.want)
+		}
+	}
+}

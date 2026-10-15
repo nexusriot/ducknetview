@@ -195,3 +195,68 @@ func TestRoutesSmoke(t *testing.T) {
 		}
 	}
 }
+
+// An IPv6-only host still has a default route, and used to be told it had
+// none at all.
+func TestDefaultRouteFallsBackToIPv6(t *testing.T) {
+	routes := []Route{
+		{Destination: "fe80::/64", Iface: "eth0", IPv6: true},
+		{Destination: "default", Gateway: "fe80::1", Iface: "eth0", Metric: 1024, IPv6: true},
+	}
+	def, ok := DefaultRoute(routes)
+	if !ok {
+		t.Fatal("an IPv6 default route should be found")
+	}
+	if def.Gateway != "fe80::1" || !def.IPv6 {
+		t.Fatalf("got %+v", def)
+	}
+
+	// Dual stack still prefers IPv4.
+	dual := append(routes, Route{Destination: "default", Gateway: "192.168.1.1", Iface: "eth0", Metric: 100})
+	if def, ok := DefaultRoute(dual); !ok || def.Gateway != "192.168.1.1" {
+		t.Fatalf("dual-stack should prefer IPv4, got %+v ok=%v", def, ok)
+	}
+	if def, ok := DefaultRouteFamily(dual, true); !ok || def.Gateway != "fe80::1" {
+		t.Fatalf("the IPv6 default should still be reachable by family: %+v ok=%v", def, ok)
+	}
+}
+
+// A link-local next hop means nothing without the link it is on.
+func TestGatewayAddressCarriesTheZone(t *testing.T) {
+	cases := []struct {
+		route Route
+		want  string
+	}{
+		{Route{Gateway: "fe80::1", Iface: "eth0", IPv6: true}, "fe80::1%eth0"},
+		{Route{Gateway: "fe80::1%eth0", Iface: "eth0", IPv6: true}, "fe80::1%eth0"},
+		{Route{Gateway: "2001:db8::1", Iface: "eth0", IPv6: true}, "2001:db8::1"},
+		{Route{Gateway: "192.168.1.1", Iface: "eth0"}, "192.168.1.1"},
+		{Route{Iface: "ppp0"}, ""},
+	}
+	for _, c := range cases {
+		if got := c.route.GatewayAddress(); got != c.want {
+			t.Errorf("%+v: got %q, want %q", c.route, got, c.want)
+		}
+	}
+}
+
+// Both first hops are probed on a dual-stack host.
+func TestGatewayTargetsCoversBothFamilies(t *testing.T) {
+	routes := []Route{
+		{Destination: "default", Gateway: "192.168.1.1", Iface: "eth0", Metric: 100},
+		{Destination: "default", Gateway: "fe80::1", Iface: "eth0", Metric: 1024, IPv6: true},
+	}
+	got := GatewayTargets(routes)
+	if len(got) != 2 {
+		t.Fatalf("want two targets, got %+v", got)
+	}
+	if got[0].Label != "gateway" || got[0].Addr != "192.168.1.1:53" {
+		t.Errorf("IPv4 target = %+v", got[0])
+	}
+	if got[1].Label != "gateway6" || got[1].Addr != "[fe80::1%eth0]:53" {
+		t.Errorf("IPv6 target = %+v", got[1])
+	}
+	if len(GatewayTargets(nil)) != 0 {
+		t.Error("no routes should mean no targets")
+	}
+}

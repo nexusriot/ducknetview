@@ -17,6 +17,7 @@ import (
 var defaultKeys = map[string]string{
 	"help":            "?",
 	"settings":        ",",
+	"views":           "V",
 	"quit":            "q",
 	"search":          "/",
 	"search-next":     "n",
@@ -83,9 +84,19 @@ func newKeymap(overrides map[string]string) keymap {
 
 	// Actions whose default key the user has taken for something else must not
 	// also keep their old key, or one press would do two things.
+	//
+	// The actions are walked in name order rather than in map order: two
+	// actions bound to the same key are resolved first-wins, and over a Go
+	// map that would hand the same config file a different keyboard on every
+	// start.
 	taken := map[string]bool{}
-	for action, key := range overrides {
-		key = strings.TrimSpace(key)
+	actions := make([]string, 0, len(overrides))
+	for action := range overrides {
+		actions = append(actions, action)
+	}
+	sort.Strings(actions)
+	for _, action := range actions {
+		key := strings.TrimSpace(overrides[action])
 		if key == "" || reservedKeys[key] {
 			continue
 		}

@@ -565,7 +565,8 @@ func TestHelpOverlayShowsEveryReboundKey(t *testing.T) {
 	m.w, m.h = 200, 60
 	m.keymap = newKeymap(overrides)
 
-	txt := stripANSI(m.renderHelp())
+	m.openHelp()
+	txt := stripANSI(m.helpText())
 	for _, action := range Actions() {
 		key := m.keymap.keyFor(action)
 		if key != overrides[action] {
@@ -601,7 +602,7 @@ func TestEveryActionReachesTheHandler(t *testing.T) {
 func TestHelpNamesTheSpaceBar(t *testing.T) {
 	m := NewModel()
 	m.w, m.h = 200, 60
-	if !strings.Contains(stripANSI(m.renderHelp()), "space") {
+	if !strings.Contains(stripANSI(m.helpText()), "space") {
 		t.Error("the help overlay does not name the space bar")
 	}
 	if got := spaceLabel("Z"); got != "Z" {

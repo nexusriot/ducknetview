@@ -6,7 +6,7 @@ _ducknetview() {
 
     opts="--once --json --from --diff --metrics --metrics-listen --top
           --usage --usage-all --daemon --check-baseline --check-config
-          --baseline --save-baseline --log-events --on-alert --tab
+          --baseline --save-baseline --log-events --on-alert --tab --view
           --version --help"
     tabs="overview interfaces ports processes procs connections conns events routes neighbours"
 
@@ -17,6 +17,10 @@ _ducknetview() {
             ;;
         --from|--baseline|--save-baseline|--log-events|--on-alert)
             COMPREPLY=( $(compgen -f -- "$cur") )
+            return 0
+            ;;
+        --view)
+            COMPREPLY=( $(compgen -W "$(ducknetview --view '' 2>&1 | sed -n 's/.*saved: //p' | tr -d ',')" -- "$cur") )
             return 0
             ;;
         --top|--usage|--metrics-listen)

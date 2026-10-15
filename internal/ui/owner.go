@@ -18,6 +18,13 @@ func (m *Model) loadASNDB() {
 		m.asnDB, m.asnErr = nil, nil
 		return
 	}
+	// A reload re-applies the whole config, and the table is the one setting
+	// that costs hundreds of megabytes and seconds of a blocked update loop to
+	// re-read. An unchanged path already has its answer loaded.
+	if m.asnDB != nil && m.asnDB.Source == m.asnPath {
+		m.asnErr = nil
+		return
+	}
 	db, err := probe.LoadASNDB(m.asnPath)
 	if err != nil {
 		m.asnDB, m.asnErr = nil, err

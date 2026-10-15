@@ -291,8 +291,10 @@ func (m Model) filteredProcs() []procRow {
 		if name == "" {
 			name = "-"
 		}
-		// Container ids are searchable, which doubles as a per-container filter.
-		if !q.match(name, fmt.Sprintf("%d", p.PID), p.User, p.Container) {
+		// Container ids are searchable, which doubles as a per-container
+		// filter; so is the command line, which is where the difference
+		// between two rows of the same name lives.
+		if !q.match(name, fmt.Sprintf("%d", p.PID), p.User, p.Container, p.Cmdline) {
 			continue
 		}
 		out = append(out, procRow{ProcNet: p, members: 1, pids: []int32{p.PID}})

@@ -82,6 +82,10 @@ func decodeSnapshot(b []byte) (Snapshot, error) {
 	return s, nil
 }
 
+// marshalSnapshot is what --json writes, in one place so a test can assert on
+// exactly the bytes that leave the process.
+func marshalSnapshot(s Snapshot) ([]byte, error) { return json.MarshalIndent(s, "", "  ") }
+
 // remoteNetSnapshot is the interface half of a snapshot, in the shape the
 // sampler would have produced.
 func remoteNetSnapshot(s Snapshot, takenAt time.Time) probe.NetSnapshot {

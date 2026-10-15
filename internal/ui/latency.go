@@ -39,10 +39,7 @@ func latencyTickEvery(d time.Duration) tea.Cmd {
 // latencyTargets is the gateway (unless it could not be determined) plus the
 // configured extras that are actually dialable.
 func (m Model) latencyTargets() []probe.LatencyTarget {
-	var targets []probe.LatencyTarget
-	if t, ok := probe.GatewayTarget(m.routes); ok {
-		targets = append(targets, t)
-	}
+	targets := probe.GatewayTargets(m.routes)
 	for _, addr := range m.latencyExtra {
 		if !dialable(addr) {
 			continue

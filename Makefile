@@ -6,7 +6,7 @@ PREFIX  ?= /usr/local
 GO      ?= go
 LDFLAGS := -s -w
 
-.PHONY: all build run install uninstall fmt vet tidy test clean deb deb-arm64
+.PHONY: all build run install uninstall fmt vet tidy test cover e2e e2e-clean clean deb deb-arm64
 
 all: build
 
@@ -40,6 +40,20 @@ tidy:
 test:
 	$(GO) test ./...
 
+cover:
+	$(GO) test -coverprofile=coverage.out -coverpkg=./... ./...
+	$(GO) tool cover -func=coverage.out | tail -1
+	@echo "html: $(GO) tool cover -html=coverage.out"
+
+# The e2e suite runs inside a container, because it needs a host whose
+# interfaces, routes and sockets it controls. Nothing on this machine is read
+# or written by it.
+e2e:
+	./e2e/run.sh
+
+e2e-clean:
+	-docker image rm ducknetview-e2e
+
 deb:
 	./build-deb.sh amd64
 
@@ -47,5 +61,5 @@ deb-arm64:
 	./build-deb-arm64.sh
 
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) coverage.out
 	rm -rf build

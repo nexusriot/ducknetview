@@ -105,12 +105,30 @@ func (m Model) renderRoutesText() string {
 		b.WriteString(errStyle.Render("Could not read the host's network configuration: "+m.hostStateErr.Error()) + "\n\n")
 	}
 
-	// Default route first: it is the answer to the most common question.
+	// Default route first: it is the answer to the most common question. Both
+	// families are listed, because on a dual-stack host they are frequently
+	// not the same box and "the gateway" then means two different machines.
 	b.WriteString(titleStyle.Render("Default route") + "\n")
-	if def, ok := probe.DefaultRoute(m.routes); ok {
-		b.WriteString(fmt.Sprintf("  %s via %s, metric %d\n",
-			okStyle.Render(def.Gateway), def.Iface, def.Metric))
-	} else {
+	found := false
+	for _, f := range []struct {
+		label string
+		v6    bool
+	}{{"IPv4", false}, {"IPv6", true}} {
+		def, ok := probe.DefaultRouteFamily(m.routes, f.v6)
+		if !ok {
+			continue
+		}
+		found = true
+		gw := def.Gateway
+		if gw == "" {
+			gw = subtleStyle.Render("on-link")
+		} else {
+			gw = okStyle.Render(gw)
+		}
+		b.WriteString(fmt.Sprintf("  %s  %s via %s, metric %d\n",
+			subtleStyle.Render(padRight(f.label, 4)), gw, def.Iface, def.Metric))
+	}
+	if !found {
 		b.WriteString("  " + warnStyle.Render("none — this host cannot reach anything off-link") + "\n")
 	}
 

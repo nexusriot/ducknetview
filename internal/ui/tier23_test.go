@@ -480,7 +480,8 @@ func TestHelpShowsBoundKeys(t *testing.T) {
 	m := NewModel()
 	m.w, m.h = 160, 50
 	m.keymap = newKeymap(map[string]string{"closed": "Z"})
-	txt := stripANSI(m.renderHelp())
+	m.openHelp()
+	txt := stripANSI(m.helpText())
 	if !strings.Contains(txt, "Z ") {
 		t.Error("the help overlay does not show the rebound key")
 	}

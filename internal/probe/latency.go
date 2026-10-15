@@ -91,9 +91,31 @@ func MeasureLatency(t LatencyTarget, timeout time.Duration) LatencySample {
 // connection still times the round trip. ok is false when there is no default
 // route to probe.
 func GatewayTarget(routes []Route) (LatencyTarget, bool) {
-	def, ok := DefaultRoute(routes)
-	if !ok || def.Gateway == "" {
+	targets := GatewayTargets(routes)
+	if len(targets) == 0 {
 		return LatencyTarget{}, false
 	}
-	return LatencyTarget{Label: "gateway", Addr: net.JoinHostPort(def.Gateway, "53")}, true
+	return targets[0], true
+}
+
+// GatewayTargets builds a probe target for each family's default gateway. A
+// dual-stack host has two first hops and they are frequently not the same box,
+// so one number for "the gateway" hides half the answer.
+func GatewayTargets(routes []Route) []LatencyTarget {
+	var out []LatencyTarget
+	for _, f := range []struct {
+		label string
+		v6    bool
+	}{{"gateway", false}, {"gateway6", true}} {
+		def, ok := DefaultRouteFamily(routes, f.v6)
+		if !ok {
+			continue
+		}
+		addr := def.GatewayAddress()
+		if addr == "" {
+			continue // a directly-attached default route has no hop to probe
+		}
+		out = append(out, LatencyTarget{Label: f.label, Addr: net.JoinHostPort(addr, "53")})
+	}
+	return out
 }

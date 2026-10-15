@@ -138,8 +138,19 @@ type Model struct {
 	// Transient status line (e.g. "copied to clipboard"), cleared on next key.
 	status string
 
-	// Help overlay (toggled with `?`).
+	// Help overlay (toggled with `?`). It lives in a viewport because the key
+	// list is longer than any terminal: unscrollable, its first two sections
+	// were simply unreachable.
 	showHelp bool
+	helpVP   viewport.Model
+
+	// Saved views (toggled with `V`): named arrangements of the tables, so a
+	// setup that took six keypresses comes back with one (see views.go).
+	showViews   bool
+	viewsCursor int
+	viewsNaming bool
+	viewsInput  textinput.Model
+	views       []savedView
 
 	// Settings overlay (toggled with `,`): the thresholds and lists that used
 	// to be hand-edited JSON (see settings.go).
@@ -255,6 +266,9 @@ type Model struct {
 	alertProcBps float64
 	alertConnBps float64
 	alertFired   map[string]time.Time
+	// Subjects currently over a threshold, so the tool can say when they stop
+	// (see alerts.go). Without it every alert is a beginning with no end.
+	alertActive  map[string]*firingAlert
 	alertHook    string
 	pendingHooks []event
 
@@ -366,6 +380,15 @@ type Model struct {
 	watch        *watchList
 	watchlistRaw []string
 
+	// Whether the "sockets owned by another user" note has been recorded as an
+	// event yet: it is reported once per session, not once per poll.
+	attribNoted bool
+
+	// Set when the config file exists but could not be read or parsed. The
+	// session runs on defaults and, crucially, never writes the file back —
+	// see saveConfig.
+	configUnsafe bool
+
 	// Expected listener set (see baseline.go), persisted so that "unexpected
 	// listener" survives a restart.
 	baseline    map[string]bool
@@ -408,6 +431,7 @@ func NewModel() Model {
 	cvp := viewport.New(0, 0)
 	evp := viewport.New(0, 0)
 	rvp := viewport.New(0, 0)
+	hvp := viewport.New(0, 0)
 
 	ps := textinput.New()
 	ps.Placeholder = "search port / address / process"
@@ -415,7 +439,7 @@ func NewModel() Model {
 	ps.CharLimit = 64
 
 	qs := textinput.New()
-	qs.Placeholder = "search process name"
+	qs.Placeholder = "search process name / command line"
 	qs.Prompt = "/ "
 	qs.CharLimit = 64
 
@@ -434,6 +458,11 @@ func NewModel() Model {
 	ss.Prompt = "> "
 	ss.CharLimit = 128
 
+	vs := textinput.New()
+	vs.Placeholder = "view name"
+	vs.Prompt = "> "
+	vs.CharLimit = maxViewNameLen
+
 	m := Model{
 		activeTab:  tabOverview,
 		netSampler: probe.NewNetSampler(),
@@ -445,6 +474,7 @@ func NewModel() Model {
 		connsVP:        cvp,
 		eventsVP:       evp,
 		routesVP:       rvp,
+		helpVP:         hvp,
 		ifaceDetailsVP: dvp,
 		portsSearch:    ps,
 		procsSearch:    qs,
@@ -462,6 +492,7 @@ func NewModel() Model {
 		startedAt:       time.Now(),
 		currentUser:     currentUsername(),
 		settingsInput:   ss,
+		viewsInput:      vs,
 		theme:           defaultTheme,
 	}
 	return m
@@ -711,6 +742,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showDetail {
 			m.setDetail(m.detailText)
 		}
+		if m.showHelp {
+			m.openHelp()
+		}
 
 		// Interfaces right
 		rightW := m.w - leftW - 3
@@ -924,14 +958,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// key. The original message is left alone, because the viewports and
 		// text inputs below still need the key that was actually pressed.
 		key := msg.String()
-		if !m.anySearching() && !m.settingsEditing {
+		if !m.anySearching() && !m.settingsEditing && !m.viewsNaming {
 			key = m.keymap.translate(key)
 		}
 
-		// While the help overlay is open, any key closes it (ctrl+c still quits).
+		// The help overlay scrolls; any other key closes it (ctrl+c still
+		// quits). It is longer than a terminal, so without this half of it
+		// could not be read at all.
 		if m.showHelp {
-			if key == "ctrl+c" {
+			switch key {
+			case "ctrl+c":
 				return m.quit()
+			case "up", "down", "k", "j", "pgup", "pgdown", "home", "end":
+				var cmd tea.Cmd
+				m.helpVP, cmd = m.helpVP.Update(msg)
+				return m, cmd
 			}
 			m.showHelp = false
 			return m, nil
@@ -954,6 +995,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// The views overlay owns the keyboard the same way the settings one
+		// does: it has a cursor and a name field, and a key that fell through
+		// would act on a table nobody can see.
+		if m.showViews {
+			if key == "ctrl+c" {
+				return m.quit()
+			}
+			// Whether the field already had focus, not whether it has it now:
+			// the keypress that opens it must not also be typed into it.
+			naming := m.viewsNaming
+			status, handled := m.viewsKey(key)
+			if status != "" {
+				m.status = status
+			}
+			if handled {
+				if naming && m.viewsNaming {
+					var cmd tea.Cmd
+					m.viewsInput, cmd = m.viewsInput.Update(msg)
+					return m, cmd
+				}
+				return m, nil
+			}
+			m.showViews = false
+			return m, nil
+		}
+
 		// The settings overlay owns the keyboard while it is open: it has a
 		// cursor and a text input of its own, and a key that fell through to
 		// the tab underneath would act on a table nobody can see.
@@ -961,12 +1028,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key == "ctrl+c" {
 				return m.quit()
 			}
+			// As above: `enter` or `space` opens the editor, and forwarding it
+			// to the input put a stray space in front of every value typed.
+			editing := m.settingsEditing
 			status, handled := m.settingsKey(key)
 			if status != "" {
 				m.status = status
 			}
 			if handled {
-				if m.settingsEditing {
+				if editing && m.settingsEditing {
 					var cmd tea.Cmd
 					m.settingsInput, cmd = m.settingsInput.Update(msg)
 					return m, cmd
@@ -1020,7 +1090,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.anySearching() {
 				break // a focused search box should receive the key
 			}
-			m.showHelp = true
+			m.openHelp()
 			return m, nil
 		case "q":
 			if m.anySearching() {
@@ -1470,6 +1540,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+		case "V":
+			// Named arrangements of the tables (see views.go).
+			if !m.anySearching() {
+				m.openViews()
+				return m, nil
+			}
+
 		case ",":
 			// The thresholds, the latency targets and the hidden columns had
 			// no binding at all until now.
@@ -1713,6 +1790,8 @@ func (m Model) View() string {
 		body = m.renderHelp()
 	case m.showSettings:
 		body = m.renderSettings()
+	case m.showViews:
+		body = m.renderViews()
 	case m.activeTab == tabOverview:
 		body = m.viewOverview()
 	case m.activeTab == tabIfaces:
@@ -1729,7 +1808,7 @@ func (m Model) View() string {
 		body = m.viewRoutes()
 	}
 
-	footer := subtleStyle.Render("Keys: ? help • , settings • 1-7 tabs • / search • ↑↓ select • enter details • s/S sort • F follow • t totals • U units • A group • T tree • z closed • i/f/o/p/v/u filter • a/b baseline • w watch • d ack • y copy • e export • x kill • q quit")
+	footer := subtleStyle.Render("Keys: ? help • , settings • 1-7 tabs • / search • ↑↓ select • enter details • s/S sort • F follow • t totals • U units • A group • T tree • z closed • i/f/o/p/v/u filter • a/b baseline • w watch • d ack • y copy • e export • x kill • V views • q quit")
 	if m.status != "" {
 		footer = okStyle.Render(m.status)
 	}
@@ -1791,7 +1870,22 @@ func renderTab(s string, active bool) string {
 	return subtleStyle.Padding(0, 1).Render(s)
 }
 
+// openHelp fills the overlay's viewport and shows it.
+func (m *Model) openHelp() {
+	m.showHelp = true
+	m.helpVP.Width = max(10, min(m.w-2, 120)-2)
+	m.helpVP.Height = max(3, m.bodyHeight()-2)
+	m.helpVP.SetContent(hardClipLinesToWidth(m.helpText(), m.helpVP.Width))
+	m.helpVP.SetYOffset(0)
+}
+
 func (m Model) renderHelp() string {
+	return boxStyle.Width(min(m.w-2, 120)).Height(m.bodyHeight()).Render(m.helpVP.View())
+}
+
+// helpText is the key list itself, rendered from the keymap so a rebound key
+// is shown as it is bound now rather than as it shipped.
+func (m Model) helpText() string {
 	var b strings.Builder
 
 	section := func(name string) { b.WriteString(titleStyle.Render(name) + "\n") }
@@ -1871,6 +1965,10 @@ func (m Model) renderHelp() string {
 	bound("events-clear", "clear the recorded events")
 	b.WriteString("\n")
 
+	section("Views")
+	bound("views", "saved views: apply, save the current one, delete")
+	b.WriteString("\n")
+
 	section("General")
 	bound("help", "toggle this help")
 	bound("settings", "settings: alert thresholds, latency targets, columns, theme")
@@ -1879,9 +1977,9 @@ func (m Model) renderHelp() string {
 	if len(m.keymap.overrides()) > 0 {
 		b.WriteString(subtleStyle.Render("Keys shown are your own bindings, from \"keys\" in the config file.") + "\n\n")
 	}
-	b.WriteString(subtleStyle.Render("press any key to close"))
+	b.WriteString(subtleStyle.Render("↑↓ scrolls · any other key closes"))
 
-	return boxStyle.Width(min(m.w-2, 120)).Height(m.bodyHeight()).Render(b.String())
+	return b.String()
 }
 
 func (m Model) viewOverview() string {
@@ -2547,7 +2645,6 @@ func (m Model) renderProcsText() string {
 	w -= gutterWidth
 
 	cols := m.procsColumns()
-	showCont := m.anyContainer()
 	colPID := cols.width("pid")
 	colName := cols.width("name")
 	colUser := cols.width("user")
@@ -2558,7 +2655,11 @@ func (m Model) renderProcsText() string {
 	colConns := cols.width("conns")
 	colListen := cols.width("listen")
 
-	b.WriteString("Processes by network connections (proxy)\n")
+	head := "Processes by network connections (proxy)"
+	if note := m.attributionNote(); note != "" {
+		head += "  " + warnStyle.Render(note)
+	}
+	b.WriteString(head + "\n")
 	sub := "↑↓ select • s/S sort: " + m.sortLabel() + " • y copy • A "
 	if m.aggregateProcs {
 		sub += "per-process"
@@ -2604,25 +2705,25 @@ func (m Model) renderProcsText() string {
 		conS := padRight(trunc(fmt.Sprintf("%d", p.ConnCount), colConns), colConns)
 		lisS := padRight(trunc(fmt.Sprintf("%d", p.ListenCount), colListen), colListen)
 
-		contS := ""
-		if showCont {
-			cell := padRight(trunc(dashIfEmpty(p.Container), colCont), colCont)
-			if p.Container == "" {
-				cell = subtleStyle.Render(cell)
-			} else {
-				cell = q.highlight(cell)
-			}
-			contS = cell + colSep
+		contS := padRight(trunc(dashIfEmpty(p.Container), colCont), colCont)
+		if p.Container == "" {
+			contS = subtleStyle.Render(contS)
+		} else {
+			contS = q.highlight(contS)
 		}
 
-		rateSeg := ""
+		cells := map[string]string{
+			"pid": pidS, "name": nameS, "user": userS, "container": contS,
+			"cpu": cpuS, "mem": memS, "conns": conS, "listen": lisS,
+		}
 		if m.hasThroughput {
-			rx, tx := m.trafficCells(m.procRate(p.PID), m.procTotal(p.PID), colRate)
-			rateSeg = rx + colSep + tx + colSep
+			cells["rx"], cells["tx"] = m.trafficCells(m.procRate(p.PID), m.procTotal(p.PID), colRate)
 		}
 
-		b.WriteString(gutter(i == m.procsCursor) + fmt.Sprintf("%s  %s  %s  %s%s  %s  %s%s\n",
-			pidS, nameS, userS, contS, cpuS, memS, rateSeg, conS+colSep+lisS))
+		// Rendered through the column list, like every other table: hand-rolling
+		// the separators here left the row carrying columns the header had
+		// dropped, so hiding one shifted every cell to its right.
+		b.WriteString(gutter(i == m.procsCursor) + cols.row(cells) + "\n")
 	}
 
 	return b.String()
@@ -3243,6 +3344,10 @@ func (m *Model) applyConnInfo(info probe.ConnInfo, now time.Time) []tea.Cmd {
 	m.noteSocketEvents(prevPorts, msg.Conns, firstRun, now)
 	m.noteThroughputAlerts(msg.Conns, now)
 	m.noteQualityAlerts(msg.Conns, now)
+	// After the rules, so a subject that breached on this very poll is not
+	// immediately considered recovered — and outside them, because a subject
+	// that has gone away entirely is no longer looked at by any rule.
+	m.noteAlertRecoveries(now)
 
 	m.portsCursor = clampInt(m.portsCursor, 0, len(m.filteredPorts())-1)
 	m.procsCursor = clampInt(m.procsCursor, 0, len(m.filteredProcs())-1)

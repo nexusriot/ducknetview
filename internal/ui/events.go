@@ -256,6 +256,8 @@ func (m *Model) noteSocketEvents(prevPorts map[string]probe.ListenPort, conns []
 		}
 	}
 
+	m.noteAttribution(rec)
+
 	if m.dstSeen == nil {
 		m.dstSeen = map[string]bool{}
 	}

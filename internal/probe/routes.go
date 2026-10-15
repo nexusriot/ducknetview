@@ -69,12 +69,24 @@ func Routes() ([]Route, error) {
 	return out, nil
 }
 
-// DefaultRoute returns the lowest-metric default route, which is the one the
-// host is actually using, and the interface it leaves by.
+// DefaultRoute returns the default route the host is actually using: the
+// lowest-metric IPv4 one, or — on a host that has no IPv4 default at all — the
+// IPv6 one. Ignoring IPv6 entirely told an IPv6-only host it "cannot reach
+// anything off-link" while it was happily routing, and left the first-hop
+// latency probe with nothing to measure.
 func DefaultRoute(routes []Route) (Route, bool) {
+	if r, ok := DefaultRouteFamily(routes, false); ok {
+		return r, true
+	}
+	return DefaultRouteFamily(routes, true)
+}
+
+// DefaultRouteFamily returns the lowest-metric default route of one address
+// family, and the interface it leaves by.
+func DefaultRouteFamily(routes []Route, v6 bool) (Route, bool) {
 	best := Route{Metric: -1}
 	for _, r := range routes {
-		if !r.IsDefault() || r.IPv6 {
+		if !r.IsDefault() || r.IPv6 != v6 {
 			continue
 		}
 		if best.Metric < 0 || r.Metric < best.Metric {
@@ -82,6 +94,23 @@ func DefaultRoute(routes []Route) (Route, bool) {
 		}
 	}
 	return best, best.Metric >= 0
+}
+
+// GatewayAddress is the gateway's address in a form that can actually be
+// dialled. A link-local IPv6 next hop is ambiguous without the interface it is
+// on — "fe80::1" is a different machine on every link — so the zone is
+// attached, which is the same thing `ip -6 route` prints as "dev eth0".
+func (r Route) GatewayAddress() string {
+	if r.Gateway == "" {
+		return ""
+	}
+	if strings.Contains(r.Gateway, "%") || r.Iface == "" {
+		return r.Gateway
+	}
+	if ip := net.ParseIP(r.Gateway); ip != nil && ip.To4() == nil && ip.IsLinkLocalUnicast() {
+		return r.Gateway + "%" + r.Iface
+	}
+	return r.Gateway
 }
 
 // readRoutes4 parses /proc/net/route, whose addresses are little-endian hex.

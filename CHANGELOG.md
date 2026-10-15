@@ -4,6 +4,141 @@ All notable changes to ducknetview. Versions are the value of
 `internal/version/version.go`, which the Makefile, `build-deb.sh` and
 `DEBIAN/control` all read.
 
+## Unreleased
+
+A review pass, then five features it suggested.
+
+### Saved views (`V`)
+
+Half the keys in the tool exist to narrow what is on screen, and getting back
+to "the established TLS connections leaving over the VPN, busiest first" meant
+pressing six of them in the right order, every session. A view is that whole
+arrangement under a name: the tab, every per-tab search and the search mode,
+every sort column and direction, the five quick filters, the interface filter,
+the event level and the view toggles. `enter` applies one, `n` saves the
+current screen, `d` deletes one, and `--view NAME` opens straight into one from
+a shell alias or a unit file. A drill is deliberately not recorded — it points
+at PIDs that will not exist next time.
+
+### Alerts say when they stop
+
+Every rule fired and then went quiet, so a pager driven by `--on-alert` was
+paged and never cleared, and the event log recorded a beginning with no end.
+The four sustained rules — throughput per process and per connection,
+round-trip time, retransmits — and the link-error rule now raise a matching
+`*_cleared` event once the subject has been back under its threshold for a
+minute, including when the subject went away entirely because the transfer
+finished or the process exited. `fanout` and `conn_growth` have no counterpart:
+a burst is a moment rather than a state, and no single poll can know that a
+scan has stopped.
+
+### An IPv6-only host has a default route after all
+
+`DefaultRoute` skipped IPv6 outright, so a host routing perfectly well over
+IPv6 was told on the Overview that it "cannot reach anything off-link", and the
+first-hop latency probe had nothing to measure. IPv4 is still preferred where
+both exist; the Routes tab lists both families, and both first hops are now
+probed (`gateway` and `gateway6`), since on a dual-stack host they are
+frequently not the same box. A link-local next hop is probed with its zone
+attached — `fe80::1%eth0` — without which it is not dialable at all.
+
+### The Processes search covers the command line
+
+A name says it is python; the arguments say which script. Forty rows called
+`python3` were indistinguishable from the search box. The command line is
+collected for the displayed processes, searchable, and shown in the detail
+overlay — and deliberately never serialised: a `--json` snapshot gets piped
+around, and an argument list can carry a password.
+
+### Sockets with no owning process say so
+
+Unprivileged, another user's sockets arrive with no PID at all, so the PROCESS
+column is a dash and the row cannot be signalled. Nothing said why, which made
+the tool look wrong rather than restricted. The Processes tab now says how
+many, and the count is recorded once per session as an `attribution_limited`
+event so a headless log explains its own gaps. Never shown to root, which can
+see every `/proc` entry there is.
+
+---
+
+The review pass that preceded them. Five defects.
+
+### An end-to-end suite, and the two overlay bugs it found
+
+Everything the tool reports comes from a live host, and none of it could be
+checked against a mock without the mock becoming a copy of the parser's own
+assumptions. So there is now an `e2e/` suite that **runs inside a container
+and treats that container as the host under test**: its network namespace is
+its own, so the suite opens known sockets, moves a known number of bytes
+across them, and asserts that the program reports them. It covers the netlink
+byte counters and RTT against a real kernel, every non-interactive mode and
+its exit code, the daemon end to end (polling, the event log, an alert hook,
+the recovery event, the HTTP exporter, `SIGHUP`, a clean `SIGTERM`), and the
+TUI itself driven on a real pseudo-terminal — a dozen ioctls rather than a
+dependency. `make e2e`; nothing on the host machine is read or written.
+
+Driving the real terminal immediately found two things no unit test would
+have:
+
+- **The help overlay was unreachable from the top.** It is around seventy
+  lines and had no scrolling, so on any terminal shorter than that its title
+  and its first two sections — Navigation and Actions — simply could not be
+  read. It is a viewport now: `↑↓` scrolls it, any other key still closes it,
+  the same contract the row-detail overlay has.
+- **The views overlay could overflow too**, once enough views were saved. The
+  list is windowed around the cursor, with "N more" markers above and below.
+
+Union statement coverage across the two suites is 88.8%, and every function in
+the codebase is now exercised by one of them — including `SignalProcess`,
+which neither suite could safely reach before and which now gets a child
+process of its own to kill.
+
+### The keypress that opened a text field was typed into it
+
+`n` in the new views overlay named every view "n…". The settings overlay, whose
+structure it copied, has always had the same flaw: `space` on a threshold put a
+space in front of whatever was typed next. Both now forward a key to the input
+only when the field already had focus.
+
+### A config it could not read was overwritten on quit
+
+`loadConfig` reported "no usable config" for a missing file and for a corrupt
+one with the same boolean, so a session that fell back to its defaults because
+of one stray comma went on to write those defaults over the file on exit. The
+watchlist, the seven alert thresholds, the key bindings, the latency targets,
+the ASN path and the saved baseline all went with it, silently. The loader now
+distinguishes "missing" from "unreadable", an unreadable file latches the
+session into never writing it back, and the status line says so.
+
+The same case is now harder to reach: the config is rewritten on nearly every
+keypress, and that write went through `os.WriteFile`, which truncates first. A
+crash, a kill or a full disk part-way through left exactly the corrupt file the
+bug above then destroyed. Config, `trend.json`, `usage.json` and
+`--save-baseline` all write through a temporary file and a rename now.
+
+### SIGHUP could stall the daemon for as long as a DNS timeout
+
+`reloadConfig` reported from `CheckConfig`, which resolves every configured
+latency target and loads the whole ASN table — on the update loop, where
+nothing else runs. An unresolvable target made a reload cost a resolver
+timeout; a 500,000-row ASN table was read twice, once for the check and once
+for the reload. Reload now uses `CheckConfigFast`, which leaves out the two
+checks that touch the network or a large file, and re-applying an unchanged
+`asn_database` path keeps the table that is already loaded. `--check-config` is
+unchanged and still does everything.
+
+### The same config file could produce a different keyboard on each start
+
+`newKeymap` resolves two actions bound to the same key first-wins, and walked a
+Go map to decide which was first. Actions are walked in name order now.
+
+### Hiding a column shifted every Processes row
+
+Every table renders its rows through its column list except Processes, which
+hand-rolled the separators. The header dropped a hidden column and the row did
+not, so `hidden_columns` misaligned the whole table from that column rightward,
+and click-to-sort then landed on the wrong column.
+
 ## 0.5.1 — 2026-10-12
 
 A documentation audit of the two large rounds that preceded it, plus the two
