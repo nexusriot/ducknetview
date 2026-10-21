@@ -129,7 +129,7 @@ func readRoutes4(path string) ([]Route, error) {
 			continue
 		}
 		fields := strings.Fields(sc.Text())
-		if len(fields) < 8 {
+		if len(fields) < 8 || isRejectRoute(fields[3]) {
 			continue
 		}
 
@@ -158,6 +158,16 @@ func readRoutes4(path string) ([]Route, error) {
 	return out, sc.Err()
 }
 
+// rtfReject is RTF_REJECT from <linux/route.h>: an "unreachable" route. The
+// kernel always lists one for ::/0 on lo, which is not a way off the host.
+const rtfReject = 0x0200
+
+// isRejectRoute reports whether a hex flags field marks the route unreachable.
+func isRejectRoute(flags string) bool {
+	v, err := strconv.ParseUint(flags, 16, 32)
+	return err == nil && v&rtfReject != 0
+}
+
 // hexIPv4 decodes the little-endian hex form /proc/net/route uses.
 func hexIPv4(s string) (net.IP, bool) {
 	v, err := strconv.ParseUint(s, 16, 32)
@@ -182,7 +192,7 @@ func readRoutes6(path string) ([]Route, error) {
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
-		if len(fields) < 10 {
+		if len(fields) < 10 || isRejectRoute(fields[8]) {
 			continue
 		}
 
@@ -204,7 +214,8 @@ func readRoutes6(path string) ([]Route, error) {
 		if gw, ok := hexIPv6(fields[4]); ok && !gw.Equal(net.IPv6unspecified) {
 			r.Gateway = gw.String()
 		}
-		if m, err := strconv.ParseInt(fields[5], 16, 32); err == nil {
+		// Unsigned: the metric is a u32, and 0xffffffff is common.
+		if m, err := strconv.ParseUint(fields[5], 16, 32); err == nil {
 			r.Metric = int(m)
 		}
 		out = append(out, r)

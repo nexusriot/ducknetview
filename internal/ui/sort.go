@@ -10,8 +10,9 @@ import (
 // Sort columns offered per table tab, cycled with `s` (direction toggled with
 // `S`). The first entry of each is the default sort key.
 var (
-	portsSortCols = []string{"proto", "port", "pid", "process", "user"}
-	procsSortCols = []string{"conns", "listen", "cpu", "mem", "rx", "tx", "pid", "name", "user"}
+	// The config stores a sort column by index, so new keys go on the end.
+	portsSortCols = []string{"proto", "port", "pid", "process", "user", "unit", "queue"}
+	procsSortCols = []string{"conns", "listen", "cpu", "mem", "rx", "tx", "pid", "name", "user", "unit"}
 	connsSortCols = []string{"pid", "proto", "state", "local", "remote", "process", "scope", "age", "rx", "tx", "rtt", "retrans", "owner"}
 	groupSortCols = []string{"conns", "host", "bytes"}
 )
@@ -94,11 +95,31 @@ func cmpPorts(a, b probe.ListenPort, col string) int {
 		if c := cmpStr(a.User, b.User); c != 0 {
 			return c
 		}
+	case "unit":
+		if c := cmpStr(a.Unit, b.Unit); c != 0 {
+			return c
+		}
+	case "queue":
+		// By how full, not how long: 100 waiting on a backlog of 4096 is
+		// calmer than 4 waiting on a backlog of 5. Unknown sorts as empty.
+		ra, _ := a.QueueRatio()
+		rb, _ := b.QueueRatio()
+		switch {
+		case ra < rb:
+			return -1
+		case ra > rb:
+			return 1
+		}
 	}
 	if c := cmpStr(a.Local, b.Local); c != 0 {
 		return c
 	}
-	return cmpInt(int(a.PID), int(b.PID))
+	if c := cmpInt(int(a.PID), int(b.PID)); c != 0 {
+		return c
+	}
+	// DNS on :53 is a TCP and a UDP socket on one address under one PID;
+	// without this they swapped places from poll to poll.
+	return cmpStr(a.Proto, b.Proto)
 }
 
 func cmpProcs(a, b probe.ProcNet, col string) int {
@@ -129,6 +150,10 @@ func cmpProcs(a, b probe.ProcNet, col string) int {
 		}
 	case "user":
 		if c := cmpStr(a.User, b.User); c != 0 {
+			return c
+		}
+	case "unit":
+		if c := cmpStr(a.Unit, b.Unit); c != 0 {
 			return c
 		}
 	}
@@ -181,7 +206,10 @@ func cmpConns(a, b probe.Conn, col string) int {
 	if c := cmpStr(a.Remote, b.Remote); c != 0 {
 		return c
 	}
-	return cmpStr(a.Local, b.Local)
+	if c := cmpStr(a.Local, b.Local); c != 0 {
+		return c
+	}
+	return cmpStr(a.Proto, b.Proto)
 }
 
 // scopeRank orders IP scopes most-routable first, so a "scope" sort surfaces

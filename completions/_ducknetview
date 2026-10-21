@@ -1,11 +1,18 @@
 #compdef ducknetview
 # zsh completion for ducknetview
 
+# An explicitly empty --view lists the saved views, one per line.
+_ducknetview_views() {
+  local -a views
+  views=( ${(f)"$(_call_program views ducknetview --view= 2>/dev/null)"} )
+  compadd -a views
+}
+
 _arguments -s \
   '--once[print a one-shot text snapshot and exit]' \
   '--json[print a snapshot as JSON and exit]' \
   '--from[browse a --json snapshot, or ssh://host for a live remote view]:snapshot file:_files' \
-  '--diff[compare two --json snapshots and exit]:snapshots:_files' \
+  '--diff[compare two --json snapshots given as arguments and exit]' \
   '--metrics[print Prometheus metrics and exit]' \
   '--metrics-listen[serve Prometheus metrics at /metrics on this address]:address:' \
   '--daemon[run headless: poll, apply the alert rules and log events]' \
@@ -19,6 +26,7 @@ _arguments -s \
   '--log-events[append events to a file as JSON lines]:log file:_files' \
   '--on-alert[run a command for each alert]:command:_command_names -e' \
   '--tab[tab to open on start]:tab:(overview interfaces ports processes procs connections conns events routes neighbours)' \
-  '--view[saved view to open on start]:view:' \
+  '--view[saved view to open on start]:view:_ducknetview_views' \
   '--version[print the version and exit]' \
-  '--help[print the option list and exit]'
+  '--help[print the option list and exit]' \
+  '*:snapshot file:_files'

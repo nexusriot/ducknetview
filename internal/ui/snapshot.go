@@ -38,6 +38,11 @@ type Snapshot struct {
 	Resolvers  []probe.Resolver          `json:"resolvers,omitempty"`
 	Wifi       map[string]probe.WifiLink `json:"wifi,omitempty"`
 	Latency    []probe.LatencySample     `json:"latency,omitempty"`
+
+	// Host-wide TCP counters, with rates over the snapshot's one-second
+	// sample. Absent from older snapshots and wherever /proc/net/snmp is
+	// unreadable.
+	TCP *probe.TCPHealth `json:"tcp,omitempty"`
 }
 
 // HasHostState reports whether the snapshot carries the host's configuration,
@@ -94,6 +99,7 @@ func remoteNetSnapshot(s Snapshot, takenAt time.Time) probe.NetSnapshot {
 		Uptime:   time.Duration(s.UptimeSeconds) * time.Second,
 		Ifaces:   s.Interfaces,
 		TakenAt:  takenAt,
+		TCP:      s.TCP,
 	}
 }
 
@@ -117,6 +123,7 @@ func (m Model) WithSnapshot(s Snapshot) Model {
 		Uptime:   time.Duration(s.UptimeSeconds) * time.Second,
 		Ifaces:   s.Interfaces,
 		TakenAt:  takenAt,
+		TCP:      s.TCP,
 	}
 	m.ports = s.Ports
 	m.procs = s.Processes

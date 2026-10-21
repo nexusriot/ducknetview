@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/nexusriot/ducknetview/internal/probe"
@@ -18,7 +19,15 @@ import (
 // baselineEligible reports whether a listener belongs in the host's expected
 // service surface. Ephemeral UDP client sockets do not: baselining those would
 // mean a permanently dirty baseline. They stay visible in the Ports table.
-func baselineEligible(p probe.ListenPort) bool { return probe.IsServiceListener(p) }
+//
+// Nor do listeners inside other network namespaces: what a container offers
+// the network is the host port that forwards to it (docker-proxy), which is a
+// host listener and baselined as one. Its own sockets are keyed by a container
+// id that changes on every recreate, and a baseline saved before namespaces
+// were enumerated would otherwise flag every one of them.
+func baselineEligible(p probe.ListenPort) bool {
+	return p.NetNS == "" && probe.IsServiceListener(p)
+}
 
 // setBaseline records the current listener set as the expected one and
 // persists it.
@@ -179,6 +188,9 @@ func (m *Model) acceptListener(p probe.ListenPort) (string, bool) {
 	if !m.hasBaseline() {
 		return "No baseline saved — press b to record one first", false
 	}
+	if p.NetNS != "" {
+		return "Listeners inside containers are not part of the baseline — accept the host port that publishes them", false
+	}
 	if !baselineEligible(p) {
 		return "Ephemeral UDP sockets are not part of the baseline", false
 	}
@@ -219,4 +231,52 @@ func BaselineComparable(ports []probe.ListenPort) int {
 		}
 	}
 	return n
+}
+
+// baselineDriftListLimit is how many off-baseline listeners the startup drift
+// event names before summarising the rest; an alert hook gets the detail as
+// one line, and a line that wraps a terminal three times is not read.
+const baselineDriftListLimit = 5
+
+// noteBaselineDrift raises one alert for listeners already outside the
+// baseline when a session starts. The first poll is deliberately the
+// "new listener" baseline, so without this a daemon restarted onto a host that
+// has been listening on something unexpected for a week would say nothing.
+// One event rather than one per listener: it is a single finding, and a hook
+// should fire once for it.
+func (m *Model) noteBaselineDrift(rec *eventRecorder) {
+	if !m.hasBaseline() {
+		return
+	}
+	var off []probe.ListenPort
+	for _, p := range m.ports {
+		if m.offBaseline(p) {
+			off = append(off, p)
+		}
+	}
+	if len(off) == 0 {
+		return
+	}
+	// Ordered by port so the same drift reads the same on every restart.
+	sort.SliceStable(off, func(i, j int) bool { return cmpPorts(off[i], off[j], "port") < 0 })
+
+	items := make([]string, 0, baselineDriftListLimit+1)
+	for i, p := range off {
+		if i == baselineDriftListLimit {
+			items = append(items, fmt.Sprintf("%d more", len(off)-i))
+			break
+		}
+		item := p.Proto + " " + p.Local
+		if label := procUnitLabel(p.PID, p.Process, p.Unit); label != "" {
+			item += " " + label
+		}
+		items = append(items, item)
+	}
+	detail := strings.Join(items, "; ")
+	if !m.baselineAt.IsZero() {
+		detail += " · baseline saved " + m.baselineAt.Format("2006-01-02")
+	}
+	n := len(off)
+	rec.add(levelAlert, "baseline_drift",
+		fmt.Sprintf("%d %s outside the baseline at startup", n, plural(n, "listener")), detail)
 }

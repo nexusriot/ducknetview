@@ -57,19 +57,56 @@ func FormatMetrics(snap probe.NetSnapshot, info probe.ConnInfo, offBaseline int,
 
 	// Listener exposure is the security-relevant summary: a rising "exposed"
 	// count is a host that started offering something to the network.
-	exposure := map[string]int{"exposed": 0, "lan": 0, "local": 0}
+	exposure := map[string]int{"exposed": 0, "lan": 0, "local": 0, "netns": 0}
 	for _, p := range info.Ports {
 		if !probe.IsServiceListener(p) {
 			continue // a client socket is not part of the host's exposure
 		}
-		host, _ := probe.SplitHostPort(p.Local)
-		if e := probe.ListenerExposure(host); e != "" {
+		if e := p.Exposure(); e != "" {
 			exposure[e]++
 		}
 	}
 	metric("listeners", "Listening sockets by reachability.", "gauge")
-	for _, key := range []string{"exposed", "lan", "local"} {
+	for _, key := range []string{"exposed", "lan", "local", "netns"} {
 		fmt.Fprintf(&b, "ducknetview_listeners{exposure=\"%s\"} %d\n", key, exposure[key])
+	}
+
+	// Accept-queue fill per TCP listener. A ratio rather than the raw depth is
+	// what a single alert rule can be written against, whatever each
+	// service's backlog happens to be.
+	// Forked workers inherit their parent's listening socket, so the same
+	// address and process name can appear once per PID; a repeated label set
+	// would make Prometheus reject the whole scrape. It is one queue anyway.
+	var queued []probe.ListenPort
+	seenQueue := map[string]bool{}
+	for _, p := range info.Ports {
+		if _, ok := p.QueueRatio(); !ok {
+			continue
+		}
+		if k := p.Local + "|" + p.Process; !seenQueue[k] {
+			seenQueue[k] = true
+			queued = append(queued, p)
+		}
+	}
+	if len(queued) > 0 {
+		metric("listener_queue_ratio", "Accept-queue depth as a fraction of the listen backlog, per TCP listener.", "gauge")
+		for _, p := range queued {
+			ratio, _ := p.QueueRatio()
+			fmt.Fprintf(&b, "ducknetview_listener_queue_ratio{local=\"%s\",process=\"%s\"} %g\n",
+				escapeLabel(p.Local), escapeLabel(p.Process), ratio)
+		}
+		metric("listener_accept_queue", "Connections waiting to be accepted, per TCP listener.", "gauge")
+		for _, p := range queued {
+			fmt.Fprintf(&b, "ducknetview_listener_accept_queue{local=\"%s\",process=\"%s\"} %d\n",
+				escapeLabel(p.Local), escapeLabel(p.Process), p.AcceptQueue)
+		}
+	}
+
+	if snap.TCP != nil {
+		metric("tcp_counter_total", "Host-wide TCP counters since boot, from /proc/net/snmp and /proc/net/netstat.", "counter")
+		for _, c := range snap.TCP.Counters() {
+			fmt.Fprintf(&b, "ducknetview_tcp_counter_total{counter=\"%s\"} %d\n", c.Key, c.Total)
+		}
 	}
 
 	scopes := map[string]int{}

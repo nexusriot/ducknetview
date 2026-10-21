@@ -110,20 +110,18 @@ func newKeymap(overrides map[string]string) keymap {
 		km.custom[action] = key
 	}
 
+	// Defaults first, custom bindings second, so a custom key that is also
+	// another action's default always wins. One pass in map order let the two
+	// writes race, and {"copy": "x"} fired copy or signal from build to build.
+	// A rebound action's own default is never entered, so that key no longer
+	// fires it.
 	for action, def := range defaultKeys {
-		key := def
-		if c, ok := km.custom[action]; ok {
-			key = c
+		if _, ok := km.custom[action]; !ok {
+			km.toDefault[def] = def
 		}
-		km.toDefault[key] = def
 	}
-	// A default key that somebody else now owns must not still fire its
-	// original action.
 	for action, key := range km.custom {
-		def := defaultKeys[action]
-		if km.toDefault[def] == def && def != key {
-			delete(km.toDefault, def)
-		}
+		km.toDefault[key] = defaultKeys[action]
 	}
 	return km
 }

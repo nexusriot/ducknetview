@@ -186,7 +186,7 @@ func (m Model) matchingRows() []bool {
 		rows := m.filteredPorts()
 		out := make([]bool, len(rows))
 		for i, p := range rows {
-			out[i] = q.match(p.Local, p.Process, p.Proto, p.User,
+			out[i] = q.match(p.Local, p.Process, p.Proto, p.User, p.Unit,
 				probe.ServiceName(portOf(p.Local), p.Proto))
 		}
 		return out
@@ -195,7 +195,7 @@ func (m Model) matchingRows() []bool {
 		rows := m.filteredProcs()
 		out := make([]bool, len(rows))
 		for i, p := range rows {
-			out[i] = q.match(p.Name, strconv.Itoa(int(p.PID)), p.User, p.Container, p.Cmdline)
+			out[i] = q.match(p.Name, strconv.Itoa(int(p.PID)), p.User, p.Container, p.Unit, p.Cmdline)
 		}
 		return out
 

@@ -260,3 +260,28 @@ func TestGatewayTargetsCoversBothFamilies(t *testing.T) {
 		t.Error("no routes should mean no targets")
 	}
 }
+
+// The kernel lists an unreachable ::/0 on lo with metric 0xffffffff. That
+// metric overflowed a signed parse to 0, so the reject route beat the real
+// default and the gateway6 probe was never created.
+func TestReadRoutes6SkipsRejectDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ipv6_route")
+	body := "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003   enp1s0\n" +
+		"00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := readRoutes6(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def, ok := DefaultRouteFamily(routes, true)
+	if !ok || def.Iface != "enp1s0" || def.Gateway != "fe80::1" || def.Metric != 1024 {
+		t.Fatalf("default6 = %+v, %v; want enp1s0 via fe80::1 metric 1024", def, ok)
+	}
+	for _, r := range routes {
+		if r.Iface == "lo" {
+			t.Fatalf("reject route kept: %+v", r)
+		}
+	}
+}

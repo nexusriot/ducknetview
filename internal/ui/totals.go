@@ -59,6 +59,7 @@ func (m *Model) addTotals(c probe.Conn, rx, tx uint64, now time.Time) {
 
 	m.sessionTotal.rx += rx
 	m.sessionTotal.tx += tx
+	m.bookUsage(c, rx, tx)
 
 	if c.PID > 0 {
 		if m.procTotals == nil {

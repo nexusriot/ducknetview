@@ -1,9 +1,12 @@
-.TH DUCKNETVIEW 1 "2026-10" "ducknetview 0.5.1" "User Commands"
+.TH DUCKNETVIEW 1 "2026-10" "ducknetview 0.6.0" "User Commands"
 .SH NAME
 ducknetview \- terminal network monitor
 .SH SYNOPSIS
 .B ducknetview
 .RI [ options ]
+.br
+.B ducknetview \-\-diff
+.I old.json new.json
 .SH DESCRIPTION
 .B ducknetview
 is a terminal user interface for watching a host's network: interfaces and their
@@ -16,7 +19,36 @@ read from the kernel's
 netlink interface \(em the same source
 .BR ss (8)
 uses. No elevated privileges are required. On other platforms those columns are
-hidden rather than shown empty.
+hidden rather than shown empty. The same dump gives each TCP listener's accept
+queue (the Ports tab's QUEUE column, as waiting/backlog), and the Overview's
+Host TCP panel reads the host\-wide counters in
+.I /proc/net/snmp
+and
+.IR /proc/net/netstat :
+listen overflows and drops, SYN cookies, retransmits, timeouts, bad segments
+and resets, as per\-minute rates.
+.PP
+On Linux, sockets in other network namespaces \(em containers on bridge
+networks, and namespaces made with
+.BR ip\-netns (8)
+\(em are enumerated through
+.IR /proc/<pid>/net ,
+one member process per namespace, and labelled in a NETNS column (container id,
+.B ip netns
+name, or
+.BR netns:<inode> ;
+.B host
+for ducknetview's own) that appears when more than one namespace is present and
+is matched by search. A container's wildcard listener is classed
+.B netns
+rather than exposed unless a
+.B docker\-proxy
+on the host publishes it. Unprivileged, other users' namespaces cannot be read,
+and byte counters inside a namespace need root (they are read after
+.BR setns (2));
+either limitation is logged once per session as a
+.B netns_limited
+event. At most 32 namespaces are scanned per poll.
 .SH OPTIONS
 .TP
 .B \-\-once
@@ -72,6 +104,15 @@ session totals, the event ring and the rate baselines, which are most of what a
 long-running daemon accumulates. A reload is itself recorded as a
 .B config_reloaded
 event, at warning level when part of the new configuration had to be ignored.
+.IP
+The first poll of a session reports nothing as new, by design. When a listener
+baseline is saved and listeners are already outside it, that poll instead
+raises one alert-level
+.B baseline_drift
+event naming them, so a daemon restarted onto a drifted host still fires
+.BR \-\-on\-alert .
+Listener and per-process throughput events name the owning systemd unit
+beside the PID, which is what a service's operator knows it by.
 .TP
 .B \-\-metrics
 Print the host's network state in Prometheus text format and exit, for a
@@ -132,7 +173,10 @@ when the config is entirely usable,
 .B 1
 when anything in it is being ignored, and
 .B 2
-when the file could not be read or parsed at all.
+when the file could not be read or parsed at all. Problems that disable
+nothing are printed as warnings and do not change the exit status: a key that
+differs from the documented one only in case (it is applied, since keys match
+case\-insensitively) and a latency target that does not resolve at the moment.
 .TP
 .BI \-\-baseline " file"
 Check against a baseline file rather than the per-user one.
@@ -159,13 +203,16 @@ in its environment. It is executed directly, never through a shell.
 .TP
 .BI \-\-tab " name"
 Open on a particular tab: overview, interfaces, ports, processes, connections,
-events or routes.
+events or routes (also procs, conns and neighbours).
 .TP
 .BI \-\-view " name"
 Open in a saved view: the whole arrangement of the tables — tab, sort, search,
 quick filters and toggles — under a name, as saved from the
 .B V
-overlay. With an unknown name the saved names are listed. Applied before
+overlay. With an unknown name the saved names are listed; an explicitly empty
+name
+.RB ( \-\-view= )
+prints the saved names one per line and exits. Applied before
 .BR \-\-tab ,
 so the two compose.
 .TP
@@ -199,9 +246,9 @@ switches between bytes and bits per second.
 .B z
 On the Connections tab, show connections that have closed.
 .B g
-groups them by remote host,
+groups the live connections by remote host and
 .B i
-filters by interface.
+filters them by interface.
 .TP
 .B b
 Save the current listeners as the expected baseline;
@@ -251,10 +298,15 @@ quits immediately.
 .SH FILES
 .TP
 .I ${XDG_CONFIG_HOME:-~/.config}/ducknetview/config.json
-Settings, the watchlist, the listener baseline and the alert thresholds.
+Settings, the watchlist, the listener baseline and the alert thresholds. The
+directory is the platform's user config directory, so on macOS it is under
+.IR ~/Library/Application\ Support .
+A
+.B \-\-daemon
+session never writes this file.
 .TP
 .I ${XDG_CONFIG_HOME:-~/.config}/ducknetview/usage.json
-Recorded daily traffic totals.
+Recorded daily traffic totals, flushed every five minutes and on exit.
 .TP
 .I ${XDG_CONFIG_HOME:-~/.config}/ducknetview/trend.json
 A day of per\-minute throughput peaks, so the Overview can show what happened
@@ -278,8 +330,8 @@ An array of column keys to leave out of the tables, for narrow terminals. A
 hidden column stays sortable with
 .BR s .
 Valid keys: age, closed, conns, container, count, cpu, host, iface, life,
-listen, local, mem, name, pid, process, procs, proto, remote, rtt, rtx, rx,
-state, states, svc, tx, user. Hiding every column of a table is ignored.
+listen, local, mem, name, netns, owner, pid, process, procs, proto, queue, remote,
+rtt, rtx, rx, state, states, svc, tx, unit, user. Hiding every column of a table is ignored.
 .TP
 .B latency_targets
 An array of extra
@@ -294,12 +346,14 @@ events.
 .B w
 adds and removes the highlighted remote.
 .TP
-.B "alert_process_bps, alert_connection_bps, alert_rtt_ms, alert_retrans_per_min, alert_conn_growth_polls, alert_fanout_hosts, alert_iface_drops_per_min"
+.B "alert_process_bps, alert_connection_bps, alert_rtt_ms, alert_retrans_per_min, alert_conn_growth_polls, alert_fanout_hosts, alert_iface_drops_per_min, alert_listen_queue_pct, alert_listen_drops_per_min, alert_close_wait"
 The alert thresholds: bytes per second for a process or a single connection,
 smoothed round\-trip time in milliseconds, retransmits per minute on one socket,
 consecutive polls of connection growth before calling it a leak, new remote
-hosts in one poll before calling it fan\-out, and errors plus drops per minute
-on one interface. Each is off when absent or
+hosts in one poll before calling it fan\-out, errors plus drops per minute
+on one interface, a TCP listener's accept queue as a percentage of its backlog,
+connections the host drops on the listen path per minute, and sockets in
+CLOSE_WAIT held by one process. Each is off when absent or
 .BR 0 ,
 since the right number is site\-specific, and each re\-fires at most once a
 minute per subject.
@@ -349,9 +403,13 @@ Both metric modes export the host's state:
 .BR ducknetview_listeners ,
 .BR ducknetview_listeners_off_baseline " (\-1 when no baseline is saved, which is not the same as clean),"
 .BR ducknetview_connections ,
-.B ducknetview_connection_retransmits_total
+.BR ducknetview_connection_retransmits_total ,
+.BR ducknetview_processes_with_sockets ,
+and on Linux
+.BR ducknetview_listener_queue_ratio ,
+.B ducknetview_listener_accept_queue
 and
-.BR ducknetview_processes_with_sockets .
+.BR ducknetview_tcp_counter_total .
 .PP
 A scrape answered by a running session adds what only it can report:
 .BR ducknetview_build_info ,
@@ -381,7 +439,7 @@ Re-read the configuration without restarting. The session's totals, event ring
 and rate baselines are kept.
 .TP
 .B SIGINT ", " SIGTERM
-Persist the day's usage totals and exit.
+Flush the usage totals counted since the last periodic flush and exit.
 .SH EXIT STATUS
 .B 0
 on success,
@@ -394,7 +452,11 @@ finds problems or
 .B \-\-diff
 finds changes, and
 .B 2
-for a usage or collection error.
+for a usage or collection error (an unknown
+.B \-\-tab
+or
+.BR \-\-view ,
+an unexpected argument, a host that cannot be read).
 .SH SEE ALSO
 .BR ss (8),
 .BR ip (8),

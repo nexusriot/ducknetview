@@ -50,3 +50,23 @@ func ListenerExposure(ip string) string {
 		return "exposed"
 	}
 }
+
+// Exposure classifies a listener like ListenerExposure, but accounts for the
+// namespace it lives in: 0.0.0.0 inside a container's namespace accepts
+// connections on the container's own interfaces, which the network cannot
+// reach unless the host forwards a port to it. Such a listener is "netns";
+// when the host does publish it, the exposure is that of the host address.
+func (p ListenPort) Exposure() string {
+	host, _ := SplitHostPort(p.Local)
+	if p.NetNS == "" {
+		return ListenerExposure(host)
+	}
+	if p.Published != "" {
+		pubHost, _ := SplitHostPort(p.Published)
+		return ListenerExposure(pubHost)
+	}
+	if e := ListenerExposure(host); e == "local" || e == "" {
+		return e
+	}
+	return "netns"
+}

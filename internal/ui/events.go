@@ -111,9 +111,8 @@ func (m *Model) recordEvent(e event) {
 		return
 	}
 	n, err := m.eventLog.Write(append(b, '\n'))
-	if err != nil && m.eventLogErr == nil {
-		m.eventLogErr = err
-		m.status = "Event log write failed: " + err.Error()
+	if err != nil {
+		m.eventLogFailed("Event log write failed", err)
 		return
 	}
 	m.eventLogBytes += int64(n)
@@ -138,22 +137,37 @@ func (m *Model) rotateEventLog() {
 	_ = m.eventLog.Close()
 	m.eventLog = nil
 
-	if err := os.Rename(m.eventLogPath, m.eventLogPath+".1"); err != nil && m.eventLogErr == nil {
-		m.eventLogErr = err
-		m.status = "Event log rotation failed: " + err.Error()
-		return
+	// A failed rename still reopens the file: returning here left the log
+	// closed for the rest of the session, silently.
+	rotated := true
+	if err := os.Rename(m.eventLogPath, m.eventLogPath+".1"); err != nil {
+		m.eventLogFailed("Event log rotation failed", err)
+		rotated = false
 	}
 	f, err := os.OpenFile(m.eventLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		if m.eventLogErr == nil {
-			m.eventLogErr = err
-			m.status = "Event log reopen failed: " + err.Error()
-		}
+		m.eventLogFailed("Event log reopen failed", err)
 		return
 	}
 	m.eventLog = f
 	m.eventLogBytes = 0
-	m.status = "Event log rotated to " + m.eventLogPath + ".1"
+	if rotated {
+		m.status = "Event log rotated to " + m.eventLogPath + ".1"
+	}
+}
+
+// eventLogFailed reports an event-log I/O error once per session. A daemon has
+// no status line, so it also goes to stderr — the journal — where otherwise the
+// log would just stop growing with nothing said.
+func (m *Model) eventLogFailed(what string, err error) {
+	if m.eventLogErr != nil {
+		return
+	}
+	m.eventLogErr = err
+	m.status = what + ": " + err.Error()
+	if m.headless {
+		fmt.Fprintln(os.Stderr, "ducknetview: "+m.status)
+	}
 }
 
 // eventRecorder batches one poll's events so the per-poll cap can be applied
@@ -200,12 +214,16 @@ func (m *Model) noteSocketEvents(prevPorts map[string]probe.ListenPort, conns []
 	rec := m.newEventRecorder(at)
 	defer rec.flush()
 
+	if firstRun {
+		m.noteBaselineDrift(rec)
+	}
+
 	// Listeners that went away this poll, indexed by the identity a service
 	// keeps when it merely rebinds: protocol, port and process name.
 	gone := map[string][]probe.ListenPort{}
 	if !firstRun {
 		for key, p := range prevPorts {
-			if _, still := m.prevPorts[key]; still || !baselineEligible(p) {
+			if _, still := m.prevPorts[key]; still || !probe.IsServiceListener(p) {
 				continue
 			}
 			id := listenerIdentity(p)
@@ -217,7 +235,9 @@ func (m *Model) noteSocketEvents(prevPorts map[string]probe.ListenPort, conns []
 		key := portKey(p)
 		// Ephemeral UDP sockets churn constantly (every DNS query is one), so
 		// they would drown the log without saying anything.
-		if !m.newPorts[key] || !baselineEligible(p) {
+		// A container's listeners are logged although they are never
+		// baselined: one appearing is still news.
+		if !m.newPorts[key] || !probe.IsServiceListener(p) {
 			continue
 		}
 
@@ -229,34 +249,35 @@ func (m *Model) noteSocketEvents(prevPorts map[string]probe.ListenPort, conns []
 			was := gone[id][0]
 			gone[id] = gone[id][1:]
 
-			before := probe.ListenerExposure(stripPort(was.Local))
-			after := probe.ListenerExposure(stripPort(p.Local))
+			before := was.Exposure()
+			after := p.Exposure()
 			level, verb := levelInfo, "rebound"
 			if exposureRank(after) > exposureRank(before) {
 				level, verb = levelAlert, "now reachable from further away"
 			}
 			rec.add(level, "listener_moved", p.Proto+" "+p.Local,
 				joinNonEmpty(fmt.Sprintf("was %s (%s → %s), %s", was.Local, before, after, verb),
-					procLabel(p.PID, p.Process)))
+					procUnitLabel(p.PID, p.Process, p.Unit)))
 			continue
 		}
 
-		level, note := levelWarn, probe.ListenerExposure(stripPort(p.Local))
+		level, note := levelWarn, p.Exposure()
 		if m.offBaseline(p) {
 			level = levelAlert
 			note += ", not in baseline"
 		}
-		rec.add(level, "listener_up", p.Proto+" "+p.Local, joinNonEmpty(note, procLabel(p.PID, p.Process)))
+		rec.add(level, "listener_up", p.Proto+" "+p.Local, joinNonEmpty(note, procUnitLabel(p.PID, p.Process, p.Unit)))
 	}
 
 	// Whatever is left really did go away.
 	for _, ps := range gone {
 		for _, p := range ps {
-			rec.add(levelInfo, "listener_down", p.Proto+" "+p.Local, procLabel(p.PID, p.Process))
+			rec.add(levelInfo, "listener_down", p.Proto+" "+p.Local, procUnitLabel(p.PID, p.Process, p.Unit))
 		}
 	}
 
 	m.noteAttribution(rec)
+	m.noteNetNS(rec)
 
 	if m.dstSeen == nil {
 		m.dstSeen = map[string]bool{}
@@ -332,7 +353,7 @@ func exposureRank(exposure string) int {
 	switch exposure {
 	case "local":
 		return 0
-	case "lan":
+	case "lan", "netns":
 		return 1
 	case "exposed":
 		return 2
@@ -374,6 +395,19 @@ func procLabel(pid int32, name string) string {
 		return fmt.Sprintf("pid %d", pid)
 	}
 	return fmt.Sprintf("pid %d (%s)", pid, name)
+}
+
+// procUnitLabel is procLabel with the systemd unit alongside the name. A
+// daemon's log is read by whoever runs the services, and "nginx.service" is
+// what they know the process by — a PID has changed by the time anyone looks.
+func procUnitLabel(pid int32, name, unit string) string {
+	if pid <= 0 || unit == "" {
+		return procLabel(pid, name)
+	}
+	if name == "" {
+		return fmt.Sprintf("pid %d (%s)", pid, unit)
+	}
+	return fmt.Sprintf("pid %d (%s, %s)", pid, name, unit)
 }
 
 // unreadAlerts counts alerts raised since they were last acknowledged, so the

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"time"
@@ -29,6 +28,26 @@ const (
 	exitDifferences = 1 // --diff found changes between the two snapshots
 	exitUsage       = 2
 )
+
+// fatal reports an error and exits with the usage/collection status the man
+// page documents. log.Fatal would exit 1, which scripts read as "differences
+// found" for --diff and --check-baseline.
+func fatal(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "ducknetview: "+format+"\n", args...)
+	os.Exit(exitUsage)
+}
+
+// flagSet reports whether a flag was given on the command line, which is the
+// only way to tell an explicit empty value from an absent one.
+func flagSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
 
 func main() {
 	once := flag.Bool("once", false, "print a one-shot snapshot and exit (no TUI)")
@@ -57,8 +76,30 @@ func main() {
 		return
 	}
 
+	// An explicitly empty --view lists the saved views, one per line, and
+	// exits. Shell completion uses it; without it, completing --view started
+	// the whole TUI.
+	if *startView == "" && flagSet("view") {
+		for _, name := range ui.ViewNames() {
+			fmt.Println(name)
+		}
+		return
+	}
+
 	if *diff {
 		os.Exit(runDiff(flag.Args()))
+	}
+
+	// Without these, a mistyped invocation fell through to the TUI or
+	// silently did something other than what was asked.
+	if flag.NArg() > 0 {
+		fatal("unexpected argument %q (only --diff takes positional arguments)", flag.Arg(0))
+	}
+	if *top < 0 || *usage < 0 {
+		fatal("--top and --usage take a positive count")
+	}
+	if *daemon && *fromFile != "" {
+		fatal("--daemon monitors this host; it cannot be combined with --from")
 	}
 
 	if *checkConfig {
@@ -71,7 +112,7 @@ func main() {
 
 	if *metrics {
 		if err := runMetrics(); err != nil {
-			log.Fatal(err)
+			fatal("%v", err)
 		}
 		return
 	}
@@ -80,22 +121,9 @@ func main() {
 		os.Exit(runDaemon(*logEvents, *onAlert, *metricsListen))
 	}
 
-	// Serving metrics without --daemon is a perfectly good exporter on its own,
-	// so it runs alongside the TUI rather than instead of it. The listener is
-	// bound here, before the program is built, so a taken port is reported on
-	// a usable terminal rather than from inside the alt screen.
-	var exporter *metricsServer
-	if *metricsListen != "" {
-		var err error
-		if exporter, err = serveMetrics(*metricsListen); err != nil {
-			log.Fatalf("metrics listener: %v", err)
-		}
-		defer exporter.Close()
-	}
-
 	if *top > 0 {
 		if err := runTop(*top); err != nil {
-			log.Fatal(err)
+			fatal("%v", err)
 		}
 		return
 	}
@@ -115,9 +143,22 @@ func main() {
 
 	if *once || *jsonOut {
 		if err := runSnapshot(*jsonOut); err != nil {
-			log.Fatal(err)
+			fatal("%v", err)
 		}
 		return
+	}
+
+	// Serving metrics without --daemon is a perfectly good exporter on its own,
+	// so it runs alongside the TUI rather than instead of it. The listener is
+	// bound here, before the program is built, so a taken port is reported on
+	// a usable terminal rather than from inside the alt screen.
+	var exporter *metricsServer
+	if *metricsListen != "" {
+		var err error
+		if exporter, err = serveMetrics(*metricsListen); err != nil {
+			fatal("metrics listener: %v", err)
+		}
+		defer exporter.Close()
 	}
 
 	// NO_COLOR is a convention worth honouring explicitly rather than hoping the
@@ -131,12 +172,12 @@ func main() {
 		if ui.IsRemoteTarget(*fromFile) {
 			var err error
 			if m, err = m.WithRemote(*fromFile); err != nil {
-				log.Fatal(err)
+				fatal("%v", err)
 			}
 		} else {
 			snap, err := ui.LoadSnapshot(*fromFile)
 			if err != nil {
-				log.Fatal(err)
+				fatal("%v", err)
 			}
 			m = m.WithSnapshot(snap)
 		}
@@ -144,7 +185,7 @@ func main() {
 	if *logEvents != "" {
 		var err error
 		if m, err = m.OpenEventLog(*logEvents); err != nil {
-			log.Fatalf("open event log: %v", err)
+			fatal("open event log: %v", err)
 		}
 	}
 	if *onAlert != "" {
@@ -157,15 +198,15 @@ func main() {
 		if m, ok = m.WithView(*startView); !ok {
 			names := ui.ViewNames()
 			if len(names) == 0 {
-				log.Fatalf("no views are saved — set the screen up and press V to save one")
+				fatal("no views are saved — set the screen up and press V to save one")
 			}
-			log.Fatalf("unknown view %q (saved: %s)", *startView, strings.Join(names, ", "))
+			fatal("unknown view %q (saved: %s)", *startView, strings.Join(names, ", "))
 		}
 	}
 	if *startTab != "" {
 		var ok bool
 		if m, ok = m.WithTab(*startTab); !ok {
-			log.Fatalf("unknown tab %q (want one of: %s)", *startTab, strings.Join(ui.TabNames(), ", "))
+			fatal("unknown tab %q (want one of: %s)", *startTab, strings.Join(ui.TabNames(), ", "))
 		}
 	}
 
@@ -181,7 +222,7 @@ func main() {
 	}
 
 	if _, err := p.Run(); err != nil {
-		log.Fatal(err)
+		fatal("%v", err)
 	}
 }
 
@@ -365,6 +406,7 @@ func takeSnapshot() (ui.Snapshot, probe.NetSnapshot, probe.ConnInfo, error) {
 	out.TakenAt = snap.TakenAt.Format(time.RFC3339)
 	out.Version = version.Version
 	out.Interfaces = snap.Ifaces
+	out.TCP = snap.TCP
 	out.Ports = info.Ports
 	out.Processes = info.Procs
 	out.Connections = info.Conns
@@ -410,17 +452,31 @@ func runSnapshot(asJSON bool) error {
 
 	fmt.Printf("\nlistening ports (%d):\n", len(info.Ports))
 	for _, p := range info.Ports {
-		host, port := probe.SplitHostPort(p.Local)
-		fmt.Printf("  %-4s %-24s %-10s %-8s %-10s %d %s\n",
+		_, port := probe.SplitHostPort(p.Local)
+		fmt.Printf("  %-4s %-24s %-10s %-8s %-10s %d %s%s\n",
 			p.Proto, p.Local, probe.ServiceName(port, p.Proto),
-			probe.ListenerExposure(host), p.User, p.PID, p.Process)
+			p.Exposure(), p.User, p.PID, p.Process, netnsSuffix(p.NetNS))
 	}
 
 	fmt.Printf("\nconnections (%d):\n", len(info.Conns))
 	for _, c := range info.Conns {
-		fmt.Printf("  %-4s %-24s -> %-24s %-12s %d %s\n",
-			c.Proto, c.Local, c.Remote, c.State, c.PID, c.Process)
+		fmt.Printf("  %-4s %-24s -> %-24s %-12s %d %s%s\n",
+			c.Proto, c.Local, c.Remote, c.State, c.PID, c.Process, netnsSuffix(c.NetNS))
+	}
+
+	// Said on stderr, so the listing itself stays the same shape for scripts.
+	if info.NetNS.Limited != "" {
+		fmt.Fprintln(os.Stderr, "ducknetview: other network namespaces:", info.NetNS.Limited)
 	}
 
 	return nil
+}
+
+// netnsSuffix tags a --once row from another network namespace (a container)
+// with that namespace; our own rows stay as they always were.
+func netnsSuffix(ns string) string {
+	if ns == "" {
+		return ""
+	}
+	return "  [netns " + ns + "]"
 }

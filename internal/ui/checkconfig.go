@@ -28,6 +28,11 @@ type ConfigProblem struct {
 	Key    string // the config key it was found under, "" for the file itself
 	Value  string // the offending value, when there is one
 	Detail string // what is wrong and what was done about it
+	// Warning marks a problem that does not disable anything: the setting is
+	// applied, or the failure may be transient. It is reported but does not
+	// fail the check, so a unit's ExecStartPre does not refuse to start at
+	// boot because DNS is not up yet.
+	Warning bool
 }
 
 func (p ConfigProblem) String() string {
@@ -53,8 +58,19 @@ type ConfigReport struct {
 	Fatal bool
 }
 
-// OK reports whether the config is entirely usable.
-func (r ConfigReport) OK() bool { return !r.Fatal && len(r.Problems) == 0 }
+// OK reports whether the config is entirely usable. Warnings do not count.
+func (r ConfigReport) OK() bool { return !r.Fatal && r.Errors() == 0 }
+
+// Errors counts the problems that leave a setting ignored.
+func (r ConfigReport) Errors() int {
+	n := 0
+	for _, p := range r.Problems {
+		if !p.Warning {
+			n++
+		}
+	}
+	return n
+}
 
 // configKeys is the set of recognised JSON keys, read off the struct tags so
 // the check cannot drift from what the loader actually understands.
@@ -129,6 +145,9 @@ func checkConfig(deep bool) ConfigReport {
 	add := func(key, value, detail string) {
 		r.Problems = append(r.Problems, ConfigProblem{Key: key, Value: value, Detail: detail})
 	}
+	warn := func(key, value, detail string) {
+		r.Problems = append(r.Problems, ConfigProblem{Key: key, Value: value, Detail: detail, Warning: true})
+	}
 
 	// A typo'd key is the quietest failure of all: the file looks right and
 	// the setting simply does not exist.
@@ -141,11 +160,18 @@ func checkConfig(deep bool) ConfigReport {
 	}
 	sort.Strings(unknown)
 	for _, key := range unknown {
+		// encoding/json matches keys case-insensitively, so the loader does
+		// apply a key that differs only in case. Calling it ignored was
+		// wrong, and failed the check for a setting that works.
+		if canon := foldedKey(known, key); canon != "" {
+			warn(key, "", "applied, but the documented spelling is "+canon)
+			continue
+		}
 		add(key, "", "unknown key, ignored — check the spelling against the documented keys")
 	}
 
 	checkRanges(&c, raw, add)
-	checkLists(&c, add, deep)
+	checkLists(&c, add, warn, deep)
 	checkAlerts(&c, add)
 	checkAppearance(&c, add, deep)
 
@@ -194,7 +220,7 @@ func checkRanges(c *config, raw map[string]json.RawMessage, add func(key, value,
 }
 
 // checkLists reports entries of the array-valued keys that are quietly dropped.
-func checkLists(c *config, add func(key, value, detail string), deep bool) {
+func checkLists(c *config, add, warn func(key, value, detail string), deep bool) {
 	for _, key := range c.HiddenColumns {
 		k := strings.ToLower(strings.TrimSpace(key))
 		if k == "" {
@@ -220,7 +246,7 @@ func checkLists(c *config, add func(key, value, detail string), deep bool) {
 		host, _, _ := net.SplitHostPort(t)
 		if deep && net.ParseIP(host) == nil {
 			if _, err := net.LookupHost(host); err != nil {
-				add("latency_targets", target,
+				warn("latency_targets", target,
 					"the host does not resolve right now, so the probe will report no response")
 			}
 		}
@@ -288,6 +314,9 @@ func checkAlerts(c *config, add func(key, value, detail string)) {
 		{"alert_conn_growth_polls", float64(c.AlertConnGrowth)},
 		{"alert_fanout_hosts", float64(c.AlertFanoutHosts)},
 		{"alert_iface_drops_per_min", c.AlertIfaceDropsPerMin},
+		{"alert_listen_queue_pct", c.AlertListenQueuePct},
+		{"alert_listen_drops_per_min", c.AlertListenDropsPerMin},
+		{"alert_close_wait", float64(c.AlertCloseWait)},
 	}
 	for _, f := range negatives {
 		if f.value < 0 {
@@ -355,7 +384,7 @@ func FormatConfigReport(r ConfigReport) string {
 		fmt.Fprintf(&b, "%s\n", r.Path)
 	}
 
-	if r.OK() {
+	if len(r.Problems) == 0 {
 		b.WriteString("  config is valid\n")
 		return b.String()
 	}
@@ -368,10 +397,16 @@ func FormatConfigReport(r ConfigReport) string {
 	}
 
 	for _, p := range r.Problems {
-		fmt.Fprintf(&b, "  %s\n", p.String())
+		if p.Warning {
+			fmt.Fprintf(&b, "  warning  %s\n", p.String())
+		} else {
+			fmt.Fprintf(&b, "  %s\n", p.String())
+		}
 	}
-	fmt.Fprintf(&b, "\n%d %s found. Every one of these is being ignored at startup.\n",
-		len(r.Problems), plural(len(r.Problems), "problem"))
+	if n := r.Errors(); n > 0 {
+		fmt.Fprintf(&b, "\n%d %s found. Every one of these is being ignored at startup.\n",
+			n, plural(n, "problem"))
+	}
 	return b.String()
 }
 
@@ -392,7 +427,7 @@ func (m *Model) reloadConfig() {
 
 	detail := "thresholds, watchlist, columns and bindings re-read"
 	level := levelInfo
-	if n := len(report.Problems); n > 0 {
+	if n := report.Errors(); n > 0 {
 		// The valid half is applied either way — saying nothing about the rest
 		// would be the same silence --check-config exists to break.
 		detail = fmt.Sprintf("%d %s in the config were ignored — run --check-config",
@@ -406,4 +441,14 @@ func (m *Model) reloadConfig() {
 
 	m.recordEvent(event{At: time.Now(), Level: level, Kind: "config_reloaded", Subject: report.Path, Detail: detail})
 	m.status = "Config reloaded: " + detail
+}
+
+// foldedKey returns the known key that matches key case-insensitively, or "".
+func foldedKey(known map[string]bool, key string) string {
+	for k := range known {
+		if strings.EqualFold(k, key) {
+			return k
+		}
+	}
+	return ""
 }

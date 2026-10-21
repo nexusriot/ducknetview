@@ -255,6 +255,7 @@ type Model struct {
 	eventLogMax   int64 // rotation threshold; eventLogMaxBytes when zero
 	eventLogErr   error
 	eventEcho     io.Writer      // headless sessions mirror events here (see daemon.go)
+	headless      bool           // run by DaemonProgram: no keyboard, nothing drawn
 	eventCounts   map[string]int // events recorded this session, by kind (see stats.go)
 	alertCount    int
 	hookErrors    int
@@ -282,6 +283,10 @@ type Model struct {
 	prevConnCounts    map[int32]int
 	connGrowth        map[int32]int
 	lastQualitySample time.Time
+	// The host TCP counters at the previous interface sample, for the listen
+	// drop rule (see tcphealth.go). nil until the first sample with counters.
+	prevTCP       *probe.TCPCounters
+	lastTCPSample time.Time
 
 	// A drill from a process or listener into its connections (see drill.go),
 	// nil when nothing is being followed.
@@ -375,6 +380,7 @@ type Model struct {
 	latencyExtra []string // extra targets from the config, beyond the gateway
 	procTotals   map[int32]*talker
 	hostTotals   map[string]*talker
+	usagePending usagePending // counted but not yet written to usage.json
 
 	// Watchlist of remote addresses to highlight (loaded from config).
 	watch        *watchList
@@ -383,6 +389,10 @@ type Model struct {
 	// Whether the "sockets owned by another user" note has been recorded as an
 	// event yet: it is reported once per session, not once per poll.
 	attribNoted bool
+	// The latest poll's foreign-namespace report, and whether its limitation
+	// has been logged this session (see noteNetNS).
+	netns      probe.NetNSStatus
+	netnsNoted bool
 
 	// Set when the config file exists but could not be read or parsed. The
 	// session runs on defaults and, crucially, never writes the file back —
@@ -423,6 +433,12 @@ func NewModel() Model {
 	ls := list.New([]list.Item{}, list.NewDefaultDelegate(), 30, 10)
 	ls.Title = "Interfaces"
 	ls.SetShowHelp(false)
+	// The list's own bindings would otherwise answer keys the model never
+	// handles: esc/q returned tea.Quit straight past m.quit(), losing the
+	// config, usage and trend saves, and `/` opened a filter whose keystrokes
+	// the global bindings kept stealing.
+	ls.DisableQuitKeybindings()
+	ls.SetFilteringEnabled(false)
 
 	// viewports (sizes are set on WindowSizeMsg)
 	pvp := viewport.New(0, 0)
@@ -559,15 +575,19 @@ func (m Model) Init() tea.Cmd {
 	if m.snapshotOnly {
 		return nil
 	}
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		m.refreshCmd(),
 		fetchConnInfoCmd(),
-		fetchExternalIPCmd(),
 		fetchHostStateCmd(),
-		extIPTickEvery(30*time.Second),
 		latencyTickEvery(latencyInterval),
 		tickEvery(m.refreshInterval),
-	)
+	}
+	// The external IP is only ever displayed. A daemon asking a third party
+	// for it every 30 seconds is 2,880 requests a day for nobody to read.
+	if !m.headless {
+		cmds = append(cmds, fetchExternalIPCmd(), extIPTickEvery(30*time.Second))
+	}
+	return tea.Batch(cmds...)
 }
 
 // quit persists settings and ends the program. Used for every quit path so the
@@ -700,6 +720,21 @@ func fetchExternalIPCmd() tea.Cmd {
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+
+	case tea.MouseMsg:
+		// An overlay owns the mouse the way it owns the keyboard: a click or
+		// wheel used to fall through and move or re-sort the hidden table.
+		var cmd tea.Cmd
+		switch {
+		case m.showHelp:
+			m.helpVP, cmd = m.helpVP.Update(msg)
+			return m, cmd
+		case m.showDetail:
+			m.detailVP, cmd = m.detailVP.Update(msg)
+			return m, cmd
+		case m.showViews || m.showSettings || m.confirmingQuit || m.confirmingKill:
+			return m, nil
+		}
 
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
@@ -953,14 +988,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A status line ("copied…") lives until the next keypress.
 		m.status = ""
 
-		// Rebinding happens here and nowhere else: every case below is written
-		// against the default key, and a remapped press is dispatched as that
-		// key. The original message is left alone, because the viewports and
-		// text inputs below still need the key that was actually pressed.
+		// Overlays and confirmation prompts read the key actually pressed:
+		// their letters are fixed and documented on screen, and translating
+		// them let a rebinding hijack one ("hide-noise": "H" turned the kill
+		// prompt's `h` for SIGHUP into a cancel).
 		key := msg.String()
-		if !m.anySearching() && !m.settingsEditing && !m.viewsNaming {
-			key = m.keymap.translate(key)
-		}
 
 		// The help overlay scrolls; any other key closes it (ctrl+c still
 		// quits). It is longer than a terminal, so without this half of it
@@ -1080,6 +1112,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pid, name := m.killPID, m.killName
 			m.confirmingKill = false
 			return m, killProcessCmd(pid, name, sig)
+		}
+
+		// Rebinding happens here and nowhere else: every case below is written
+		// against the default key, and a remapped press is dispatched as that
+		// key. The original message is left alone, because the viewports and
+		// text inputs below still need the key that was actually pressed.
+		if !m.anySearching() {
+			key = m.keymap.translate(key)
 		}
 
 		switch key {
@@ -1326,7 +1366,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case " ":
 			// Pause / resume auto-refresh.
 			if !m.anySearching() {
-				if m.snapshotOnly {
+				// A live remote session is snapshotOnly too, but it polls,
+				// and the tick handler honours pausing it.
+				if m.snapshotOnly && !m.remoteLive() {
 					m.status = "Viewing a snapshot — there is nothing to resume"
 					return m, nil
 				}
@@ -2059,7 +2101,7 @@ func (m Model) viewOverview() string {
 	// Top talkers are only worth the vertical space once traffic has been
 	// accounted, and only when the box is tall enough to hold them without
 	// pushing the external IP out of view.
-	for _, panel := range []string{m.renderTrend(details), m.renderLatency(details), m.renderTopTalkers(details), m.renderChurn(details)} {
+	for _, panel := range []string{m.renderTrend(details), m.renderLatency(details), m.renderTopTalkers(details), m.renderChurn(details), m.renderTCPHealth(details)} {
 		if panel == "" {
 			continue
 		}
@@ -2178,6 +2220,7 @@ func (m Model) connsColumns() colSpecs {
 	colIface := 8
 	colPID := 7
 	colOwner := 18
+	colNetNS := 12
 
 	// The interface column only earns its width when connections actually span
 	// more than one link — on a single-NIC host every row would say the same
@@ -2186,6 +2229,8 @@ func (m Model) connsColumns() colSpecs {
 	// The owner column exists only when a database was loaded, so a host
 	// without one is not given a column of dashes.
 	showOwner := m.asnDB.Len() > 0
+	// Likewise the namespace column, only once a container's sockets are seen.
+	showNetNS := m.anyNetNS()
 
 	// Remaining width split between LOCAL, REMOTE, PROCESS.
 	fixed := colProto + 2 + colSvc + 2 + colState + 2 + colAge + 2 + colPID + 2
@@ -2194,6 +2239,9 @@ func (m Model) connsColumns() colSpecs {
 	}
 	if showOwner {
 		fixed += colOwner + 2
+	}
+	if showNetNS {
+		fixed += colNetNS + 2
 	}
 	if m.hasThroughput {
 		fixed += 2*(colRate+2) + colRTT + 2 + colRTX + 2
@@ -2222,6 +2270,9 @@ func (m Model) connsColumns() colSpecs {
 	}
 	if showIface {
 		cols = append(cols, colSpec{key: "iface", title: "IFACE", width: colIface, sort: "iface"})
+	}
+	if showNetNS {
+		cols = append(cols, colSpec{key: "netns", title: "NETNS", width: colNetNS})
 	}
 	if m.hasThroughput {
 		rxHdr, txHdr := m.trafficHeaders()
@@ -2264,6 +2315,7 @@ func (m Model) renderConnsText() string {
 	colRTX := cols.width("rtx")
 	colIface := cols.width("iface")
 	colOwner := cols.width("owner")
+	colNetNS := cols.width("netns")
 	colPID := cols.width("pid")
 	colProc := cols.width("process")
 
@@ -2330,6 +2382,7 @@ func (m Model) renderConnsText() string {
 			"state": state, "age": age, "pid": pid, "process": procTr,
 			"iface": padRight(trunc(dashIfEmpty(m.ifaceFor(c)), colIface), colIface),
 			"owner": q.highlight(padRight(trunc(dashIfEmpty(m.ownerOf(c.Remote)), colOwner), colOwner)),
+			"netns": netnsCell(c.NetNS, colNetNS, q),
 		}
 		if m.hasThroughput {
 			cells["rx"], cells["tx"] = m.trafficCells(m.connRate(c), m.connTotal(c), colRate)
@@ -2467,7 +2520,8 @@ func (m Model) renderConnsGrouped() string {
 }
 
 // portsColumns is the Ports table's layout: the single description the header,
-// the rows and the click-to-sort hit-testing all read.
+// the rows and the click-to-sort hit-testing all read. The UNIT column, like
+// the Processes table's CONTAINER, only appears when some listener has one.
 func (m Model) portsColumns() colSpecs {
 	w := m.portsVP.Width
 	if w <= 0 {
@@ -2479,20 +2533,106 @@ func (m Model) portsColumns() colSpecs {
 	colSvc := 10
 	colUser := 10
 	colPID := 7
-	colLocal := min(30, max(16, w-colProto-colSvc-colUser-colPID-2-2-2-2-1-10))
-	rest := w - (colProto + 2 + colLocal + 2 + colSvc + 2 + colUser + 2 + colPID + 2)
+	colUnit := 0
+	if m.anyPortUnit() {
+		colUnit = unitColWidth + 2
+	}
+	// The accept queue is only known where sock_diag reports it; elsewhere
+	// the column would be a wall of dashes.
+	colQueue := 0
+	if m.portsHaveQueues() {
+		colQueue = 9 // "4096/4096"
+	}
+	queueW := 0
+	if colQueue > 0 {
+		queueW = colQueue + 2
+	}
+	colNetNS := 0
+	if m.anyNetNS() {
+		colNetNS = 12
+	}
+	netnsSpan := 0
+	if colNetNS > 0 {
+		netnsSpan = colNetNS + 2
+	}
+	colLocal := min(30, max(16, w-colProto-colSvc-colUser-colPID-colUnit-queueW-netnsSpan-2-2-2-2-1-10))
+	rest := w - (colProto + 2 + colLocal + 2 + colSvc + 2 + colUser + 2 + colPID + 2 + colUnit + queueW + netnsSpan)
 	if rest < 5 {
 		rest = 5
 	}
 
-	return m.visible(colSpecs{
+	cols := colSpecs{
 		{key: "proto", title: "PR", width: colProto, sort: "proto"},
 		{key: "local", title: "LOCAL", width: colLocal, sort: "port"},
 		{key: "svc", title: "SERVICE", width: colSvc},
-		{key: "user", title: "USER", width: colUser, sort: "user"},
-		{key: "pid", title: "PID", width: colPID, sort: "pid"},
-		{key: "process", title: "PROCESS", width: rest, sort: "process"},
-	})
+	}
+	if colNetNS > 0 {
+		cols = append(cols, colSpec{key: "netns", title: "NETNS", width: colNetNS})
+	}
+	cols = append(cols, colSpec{key: "user", title: "USER", width: colUser, sort: "user"})
+	if colUnit > 0 {
+		cols = append(cols, colSpec{key: "unit", title: "UNIT", width: unitColWidth, sort: "unit"})
+	}
+	cols = append(cols, colSpec{key: "pid", title: "PID", width: colPID, sort: "pid"})
+	if colQueue > 0 {
+		cols = append(cols, colSpec{key: "queue", title: "QUEUE", width: colQueue, sort: "queue"})
+	}
+	cols = append(cols, colSpec{key: "process", title: "PROCESS", width: rest, sort: "process"})
+	return m.visible(cols)
+}
+
+// unitColWidth fits the common unit names ("nginx.service", "session-2.scope")
+// whole; the long generated ones ("app-gnome-org.gnome.Terminal-…") are cut,
+// and the detail overlay carries them in full.
+const unitColWidth = 16
+
+// unitCell renders a UNIT cell: dimmed dash when there is none, search
+// highlight otherwise.
+func unitCell(unit string, width int, q matcher) string {
+	s := padRight(trunc(dashIfEmpty(unit), width), width)
+	if unit == "" {
+		return subtleStyle.Render(s)
+	}
+	return q.highlight(s)
+}
+
+// portsHaveQueues reports whether any listener carries accept-queue figures,
+// which decides whether the QUEUE column exists.
+func (m Model) portsHaveQueues() bool {
+	for _, p := range m.ports {
+		if p.Backlog > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// queueCell renders a listener's accept queue as "depth/backlog", coloured as
+// it fills. The cell is padded before styling so the escape codes cannot
+// disturb the alignment.
+func queueCell(p probe.ListenPort, width int) string {
+	ratio, ok := p.QueueRatio()
+	if !ok {
+		return padRight("-", width)
+	}
+	cell := padRight(trunc(fmt.Sprintf("%d/%d", p.AcceptQueue, p.Backlog), width), width)
+	return queueStyle(ratio).Render(cell)
+}
+
+// queueStyle colours an accept-queue fill ratio. Half full is already unusual —
+// a healthy service drains its queue every time it calls accept() — and near
+// full means the next burst will be dropped.
+func queueStyle(ratio float64) lipgloss.Style {
+	switch {
+	case ratio >= 0.9:
+		return errStyle
+	case ratio >= 0.5:
+		return warnStyle
+	case ratio > 0:
+		return lipgloss.NewStyle()
+	default:
+		return subtleStyle
+	}
 }
 
 func (m Model) renderPortsText() string {
@@ -2509,7 +2649,10 @@ func (m Model) renderPortsText() string {
 	colLocal := cols.width("local")
 	colSvc := cols.width("svc")
 	colUser := cols.width("user")
+	colUnit := cols.width("unit")
 	colPID := cols.width("pid")
+	colQueue := cols.width("queue")
+	colNetNS := cols.width("netns")
 	rest := cols.width("process")
 
 	sub := "↑↓ select • s/S sort: " + m.sortLabel() + " • y copy"
@@ -2564,7 +2707,7 @@ func (m Model) renderPortsText() string {
 		case !q.empty():
 			localTr = q.highlight(localCell)
 		case local != "-":
-			localTr = exposureStyle(probe.ListenerExposure(stripPort(p.Local))).Render(localCell)
+			localTr = exposureStyle(p.Exposure()).Render(localCell)
 		default:
 			localTr = localCell
 		}
@@ -2575,16 +2718,18 @@ func (m Model) renderPortsText() string {
 
 		b.WriteString(gutter(i == m.portsCursor) + cols.row(map[string]string{
 			"proto": proto, "local": localTr, "svc": svcTr,
-			"user": userTr, "pid": pid, "process": procTr,
+			"user": userTr, "unit": unitCell(p.Unit, colUnit, q), "pid": pid,
+			"queue": queueCell(p, colQueue), "process": procTr,
+			"netns": netnsCell(p.NetNS, colNetNS, q),
 		}) + "\n")
 	}
 
 	return b.String()
 }
 
-// procsColumns is the Processes table's layout. The CONTAINER column only earns
-// its width on a host actually running containers, and the throughput columns
-// only where the kernel can account for sockets.
+// procsColumns is the Processes table's layout. The CONTAINER and UNIT columns
+// only earn their width on a host actually running containers or systemd, and
+// the throughput columns only where the kernel can account for sockets.
 func (m Model) procsColumns() colSpecs {
 	w := m.procsVP.Width
 	if w <= 0 {
@@ -2602,11 +2747,15 @@ func (m Model) procsColumns() colSpecs {
 	colListen := 6
 
 	showCont := m.anyContainer()
+	showUnit := m.anyProcUnit()
 
 	// Seven base columns, so six two-space separators.
 	fixed := colPID + colUser + colCPU + colMem + colConns + colListen + 12
 	if showCont {
 		fixed += colCont + 2
+	}
+	if showUnit {
+		fixed += unitColWidth + 2
 	}
 	if m.hasThroughput {
 		fixed += 2 * (colRate + 2)
@@ -2620,6 +2769,9 @@ func (m Model) procsColumns() colSpecs {
 	}
 	if showCont {
 		cols = append(cols, colSpec{key: "container", title: "CONTAINER", width: colCont})
+	}
+	if showUnit {
+		cols = append(cols, colSpec{key: "unit", title: "UNIT", width: unitColWidth, sort: "unit"})
 	}
 	cols = append(cols,
 		colSpec{key: "cpu", title: "CPU%", width: colCPU, sort: "cpu"},
@@ -2649,6 +2801,7 @@ func (m Model) renderProcsText() string {
 	colName := cols.width("name")
 	colUser := cols.width("user")
 	colCont := cols.width("container")
+	colUnit := cols.width("unit")
 	colCPU := cols.width("cpu")
 	colMem := cols.width("mem")
 	colRate := cols.width("rx")
@@ -2714,7 +2867,8 @@ func (m Model) renderProcsText() string {
 
 		cells := map[string]string{
 			"pid": pidS, "name": nameS, "user": userS, "container": contS,
-			"cpu": cpuS, "mem": memS, "conns": conS, "listen": lisS,
+			"unit": unitCell(p.Unit, colUnit, q),
+			"cpu":  cpuS, "mem": memS, "conns": conS, "listen": lisS,
 		}
 		if m.hasThroughput {
 			cells["rx"], cells["tx"] = m.trafficCells(m.procRate(p.PID), m.procTotal(p.PID), colRate)
@@ -3213,6 +3367,7 @@ func (m *Model) applyNetSnapshot(snap probe.NetSnapshot) {
 
 	m.noteIfaceEvents(m.lastSnap)
 	m.noteIfaceAlerts(m.lastSnap)
+	m.noteListenDropAlerts(m.lastSnap)
 	m.rebuildIfaceList()
 
 	histMax := max(30, min(200, m.w/2))
@@ -3266,6 +3421,7 @@ func (m *Model) applyConnInfo(info probe.ConnInfo, now time.Time) []tea.Cmd {
 	m.ports = msg.Ports
 	m.procs = msg.Procs
 	m.conns = msg.Conns
+	m.netns = msg.NetNS
 	m.polls++
 	m.lastPollAt = now
 
@@ -3344,6 +3500,7 @@ func (m *Model) applyConnInfo(info probe.ConnInfo, now time.Time) []tea.Cmd {
 	m.noteSocketEvents(prevPorts, msg.Conns, firstRun, now)
 	m.noteThroughputAlerts(msg.Conns, now)
 	m.noteQualityAlerts(msg.Conns, now)
+	m.noteTCPHealthAlerts(msg.Ports, msg.Procs, now)
 	// After the rules, so a subject that breached on this very poll is not
 	// immediately considered recovered — and outside them, because a subject
 	// that has gone away entirely is no longer looked at by any rule.

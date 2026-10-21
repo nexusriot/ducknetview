@@ -10,6 +10,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.7.4
 	github.com/muesli/termenv v0.15.2
 	github.com/shirou/gopsutil/v4 v4.25.1
+	golang.org/x/sys v0.28.0
 )
 
 require (
@@ -34,7 +35,6 @@ require (
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	golang.org/x/sync v0.9.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/term v0.17.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 )

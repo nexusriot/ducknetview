@@ -48,11 +48,77 @@ func dashIfEmpty(s string) string {
 // be inspected (typically another user's process without privileges).
 func userOrDash(user string) string { return dashIfEmpty(user) }
 
+// anyNetNS reports whether any socket on screen lives in another network
+// namespace, deciding whether the NETNS column is worth its width: on a host
+// without containers every row would say "host".
+func (m Model) anyNetNS() bool {
+	for _, p := range m.ports {
+		if p.NetNS != "" {
+			return true
+		}
+	}
+	for _, c := range m.conns {
+		if c.NetNS != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// netnsLabel is a row's NETNS cell: its namespace, or "host" for our own.
+func netnsLabel(ns string) string {
+	if ns == "" {
+		return probe.HostNetNSLabel
+	}
+	return ns
+}
+
+// netnsSearchField is what a search matches a row's namespace against. "host"
+// is only offered once the NETNS column shows it; before that, searching for
+// "host" would match every row for a reason nobody can see.
+func (m Model) netnsSearchField(ns string) string {
+	if ns == "" && !m.anyNetNS() {
+		return ""
+	}
+	return netnsLabel(ns)
+}
+
+// netnsCell renders a NETNS cell; our own namespace is dimmed so the
+// containers stand out.
+func netnsCell(ns string, width int, q matcher) string {
+	cell := padRight(trunc(netnsLabel(ns), width), width)
+	if ns == "" && q.empty() {
+		return subtleStyle.Render(cell)
+	}
+	return q.highlight(cell)
+}
+
 // anyContainer reports whether any displayed process is running inside a
 // container, deciding whether the CONTAINER column is worth its width.
 func (m Model) anyContainer() bool {
 	for _, p := range m.procs {
 		if p.Container != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// anyProcUnit and anyPortUnit decide whether the UNIT column is worth its
+// width: on a host without systemd (or a remote that does not report units)
+// it would be a column of dashes.
+func (m Model) anyProcUnit() bool {
+	for _, p := range m.procs {
+		if p.Unit != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m Model) anyPortUnit() bool {
+	for _, p := range m.ports {
+		if p.Unit != "" {
 			return true
 		}
 	}
@@ -74,13 +140,25 @@ func clampInt(v, lo, hi int) int {
 
 // connKey identifies a connection by its proto + local + remote tuple, used to
 // diff consecutive enumerations for new/closed detection.
+//
+// Another network namespace can hold the very same tuple (every container has
+// its own 127.0.0.1), so a namespaced row carries its namespace in the key.
+// Host rows keep the bare form, which saved state may already use.
 func connKey(c probe.Conn) string {
+	if c.NetNS != "" {
+		return c.Proto + "|" + c.Local + "|" + c.Remote + "|" + c.NetNS
+	}
 	return c.Proto + "|" + c.Local + "|" + c.Remote
 }
 
 // portKey identifies a listening socket by its proto + bind address, used to
 // detect newly-appeared listeners between enumerations.
+// As with connKey, a namespaced listener carries its namespace: two
+// containers both listening on 0.0.0.0:80 are two listeners.
 func portKey(p probe.ListenPort) string {
+	if p.NetNS != "" {
+		return p.Proto + "|" + p.Local + "|" + p.NetNS
+	}
 	return p.Proto + "|" + p.Local
 }
 
@@ -91,7 +169,7 @@ func (m Model) securityCounts() (exposed, public, watch int) {
 	for _, p := range m.ports {
 		// Client sockets are not part of the host's exposure, and counting them
 		// would make this number twitch with every DNS query.
-		if probe.IsServiceListener(p) && probe.ListenerExposure(stripPort(p.Local)) == "exposed" {
+		if probe.IsServiceListener(p) && p.Exposure() == "exposed" {
 			exposed++
 		}
 	}
@@ -271,7 +349,9 @@ func (m Model) filteredPorts() []probe.ListenPort {
 		if local == ":" || local == "0.0.0.0:0" {
 			local = "-"
 		}
-		if !q.match(local, proc, p.Proto, probe.ServiceName(portOf(p.Local), p.Proto), p.User) {
+		// The namespace label is searchable, which doubles as a per-container
+		// (or "host") filter.
+		if !q.match(local, proc, p.Proto, probe.ServiceName(portOf(p.Local), p.Proto), p.User, p.Unit, m.netnsSearchField(p.NetNS)) {
 			continue
 		}
 		out = append(out, p)
@@ -291,10 +371,10 @@ func (m Model) filteredProcs() []procRow {
 		if name == "" {
 			name = "-"
 		}
-		// Container ids are searchable, which doubles as a per-container
-		// filter; so is the command line, which is where the difference
-		// between two rows of the same name lives.
-		if !q.match(name, fmt.Sprintf("%d", p.PID), p.User, p.Container, p.Cmdline) {
+		// Container ids and units are searchable, which doubles as a
+		// per-container or per-service filter; so is the command line, which
+		// is where the difference between two rows of the same name lives.
+		if !q.match(name, fmt.Sprintf("%d", p.PID), p.User, p.Container, p.Unit, p.Cmdline) {
 			continue
 		}
 		out = append(out, procRow{ProcNet: p, members: 1, pids: []int32{p.PID}})
@@ -324,7 +404,7 @@ func (m Model) filteredConns() []probe.Conn {
 			proc = "-"
 		}
 		if !q.match(c.Local, c.Remote, m.dnsDisplay(c.Remote), proc, c.State, c.Proto,
-			probe.ServiceName(portOf(c.Remote), c.Proto), c.User) {
+			probe.ServiceName(portOf(c.Remote), c.Proto), c.User, m.netnsSearchField(c.NetNS)) {
 			continue
 		}
 		out = append(out, c)

@@ -215,7 +215,8 @@ func ifaceNameByIndex(index int) string {
 // answer is still better than none.
 func readNeighbourCache() ([]Neighbour, error) {
 	out, err := neighboursNetlink(ifaceNameByIndex)
-	if err == nil && len(out) > 0 {
+	// A partial dump still carries IPv6 entries the ARP file never will.
+	if len(out) > 0 {
 		return out, nil
 	}
 	arp, arpErr := readNeighbours(procNetARP)

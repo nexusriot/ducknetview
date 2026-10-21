@@ -37,7 +37,9 @@ func exposureStyle(exposure string) lipgloss.Style {
 	switch exposure {
 	case "exposed":
 		return exposedStyle
-	case "lan":
+	case "lan", "netns":
+		// Inside a container's namespace and not published: reachable from
+		// the host and its bridges, not the network.
 		return lanStyle
 	case "local":
 		return scopeLocalStyle

@@ -2,6 +2,7 @@ package probe
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/host"
@@ -44,12 +45,20 @@ type NetSnapshot struct {
 	Uptime   time.Duration
 	Ifaces   []IfaceInfo
 	TakenAt  time.Time
+	// Host-wide TCP counters; nil where /proc/net/snmp cannot be read.
+	TCP *TCPHealth
 }
 
 // keep last totals to compute deltas
 type NetSampler struct {
-	last   map[string]gnet.IOCountersStat
-	lastAt time.Time
+	// mu serialises samples. The TUI runs Sample from command goroutines, and
+	// two can overlap (an `R` during a tick, a slow host.Info past the next
+	// tick); unguarded they raced on last/lastAt and could leave an older
+	// timestamp behind, skewing the next rate.
+	mu      sync.Mutex
+	last    map[string]gnet.IOCountersStat
+	lastAt  time.Time
+	lastTCP *TCPCounters
 }
 
 // Rate returns (cur-prev)/dt in units per second. It guards against counter resets
@@ -70,6 +79,8 @@ func NewNetSampler() *NetSampler {
 }
 
 func (s *NetSampler) Sample() (NetSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	now := time.Now()
 
 	hi, _ := host.Info()
@@ -135,6 +146,17 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 		out = append(out, ii)
 	}
 
+	// TCP counters are a bonus, like the per-socket stats: a /proc without
+	// them must not cost the interface view.
+	var tcp *TCPHealth
+	if tc, err := ReadTCPCounters(); err == nil {
+		tcp = &TCPHealth{Totals: tc}
+		if s.lastTCP != nil {
+			tcp.PerSec = TCPRates(tc, *s.lastTCP, dt)
+		}
+		s.lastTCP = &tc
+	}
+
 	// update sampler state
 	s.last = cur
 	s.lastAt = now
@@ -144,5 +166,6 @@ func (s *NetSampler) Sample() (NetSnapshot, error) {
 		Uptime:   uptime,
 		Ifaces:   out,
 		TakenAt:  now,
+		TCP:      tcp,
 	}, nil
 }

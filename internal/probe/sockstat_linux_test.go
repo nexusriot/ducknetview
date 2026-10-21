@@ -150,3 +150,23 @@ func TestParseDiagMessageOldKernelTcpInfo(t *testing.T) {
 		t.Errorf("MinRTT = %s, want zero when the kernel did not report it", st.MinRTT)
 	}
 }
+
+// A listener is reported with its accept-queue depth in RecvQ and the backlog
+// in SendQ, and must be returned even without tcp_info.
+func TestParseDiagMessageListener(t *testing.T) {
+	data := diagMessage([4]byte{0, 0, 0, 0}, [4]byte{0, 0, 0, 0}, 8080, 0, 0, 0, 0, 0)
+	data[1] = tcpStateListen
+	binary.NativeEndian.PutUint32(data[diagMsgRecvQ:], 12)
+	binary.NativeEndian.PutUint32(data[diagMsgSendQ:], 128)
+
+	key, st, ok := parseDiagMessage(data)
+	if !ok {
+		t.Fatal("ok = false for a listener without tcp_info")
+	}
+	if want := ListenKey("0.0.0.0:8080"); key != want {
+		t.Errorf("key = %q, want %q", key, want)
+	}
+	if st.RecvQ != 12 || st.SendQ != 128 {
+		t.Errorf("queue = %d/%d, want 12/128", st.RecvQ, st.SendQ)
+	}
+}

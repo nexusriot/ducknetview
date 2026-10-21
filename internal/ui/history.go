@@ -64,7 +64,7 @@ func LoadUsageHistory() usageHistory {
 	return h
 }
 
-// mergeSession folds one session's totals into the day it ended on.
+// mergeSession folds a stretch of counted traffic into the given day.
 func (h usageHistory) mergeSession(day string, total byteTotals, procs, hosts map[string]uint64) usageHistory {
 	idx := -1
 	for i := range h.Days {
@@ -127,10 +127,48 @@ func mergeCounts(into, add map[string]uint64, keep int) map[string]uint64 {
 	return trimmed
 }
 
-// saveUsage merges this session's totals into the history file. Best-effort:
-// failing to record usage must never stop the tool from exiting.
-func (m Model) saveUsage() {
-	if !m.sessionTotal.any() {
+// usagePending is traffic counted since the history file was last written.
+// Flushing what accumulated, rather than the session's running totals, is what
+// lets the file be written more than once per session without counting
+// anything twice.
+type usagePending struct {
+	total        byteTotals
+	procs, hosts map[string]uint64
+}
+
+// bookUsage records one connection's byte delta for the next history flush.
+func (m *Model) bookUsage(c probe.Conn, rx, tx uint64) {
+	// A snapshot or remote session describes another machine, and is never
+	// written to this host's history.
+	if m.snapshotOnly {
+		return
+	}
+	p := &m.usagePending
+	if p.procs == nil {
+		p.procs = map[string]uint64{}
+		p.hosts = map[string]uint64{}
+	}
+	p.total.rx += rx
+	p.total.tx += tx
+	if c.PID > 0 {
+		name := c.Process
+		if name == "" {
+			name = "-"
+		}
+		p.procs[name] += rx + tx
+	}
+	if host := stripPort(c.Remote); host != "" {
+		p.hosts[host] += rx + tx
+	}
+}
+
+// saveUsage merges the traffic counted since the last flush into today's entry
+// of the history file. It runs on quit and alongside the trend flush, so a
+// daemon that is killed, or one running for weeks, neither loses its history
+// nor books a fortnight onto the day it stopped. Best-effort: failing to record
+// usage must never stop the tool from exiting.
+func (m *Model) saveUsage() {
+	if !m.usagePending.total.any() {
 		return
 	}
 	p, err := historyPath()
@@ -138,31 +176,15 @@ func (m Model) saveUsage() {
 		return
 	}
 
-	procs := make(map[string]uint64, len(m.procTotals))
-	for _, t := range m.procTotals {
-		name := t.label
-		if name == "" {
-			name = "-"
-		}
-		procs[name] += t.totals.sum()
-	}
-	hosts := make(map[string]uint64, len(m.hostTotals))
-	for _, t := range m.hostTotals {
-		hosts[t.label] += t.totals.sum()
-	}
-
-	h := LoadUsageHistory().mergeSession(m.sessionDay(), m.sessionTotal, procs, hosts)
+	pend := m.usagePending
+	h := LoadUsageHistory().mergeSession(time.Now().Format("2006-01-02"), pend.total, pend.procs, pend.hosts)
 	b, err := json.MarshalIndent(h, "", "  ")
 	if err != nil {
 		return
 	}
-	_ = writeFileAtomic(p, append(b, '\n'), 0o644)
-}
-
-// sessionDay is the day the totals are booked against: the day the session
-// ends, which is where a long overnight run lands.
-func (m Model) sessionDay() string {
-	return time.Now().Format("2006-01-02")
+	if writeFileAtomic(p, append(b, '\n'), 0o644) == nil {
+		m.usagePending = usagePending{}
+	}
 }
 
 // FormatUsage renders the recorded history for `--usage`, newest day first.

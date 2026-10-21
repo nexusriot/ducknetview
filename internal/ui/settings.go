@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,7 +54,9 @@ func settingsRows() []settingRow {
 					return title + " disabled", true
 				}
 				f, err := strconv.ParseFloat(v, 64)
-				if err != nil || f < 0 {
+				// ParseFloat accepts "NaN" and "Inf": a NaN threshold never
+				// fires, and Inf overflows the integer-valued rules.
+				if err != nil || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
 					return "Not a number: " + v, false
 				}
 				set(m, f)
@@ -84,6 +87,15 @@ func settingsRows() []settingRow {
 		numeric("alert_iface_drops_per_min", "Interface drops", "errors and drops per minute on one link",
 			func(m *Model) float64 { return m.alertRules.ifaceDropsPerMin },
 			func(m *Model, v float64) { m.alertRules.ifaceDropsPerMin = v }),
+		numeric("alert_listen_queue_pct", "Accept queue", "percent of a listener's backlog waiting to be accepted",
+			func(m *Model) float64 { return m.alertRules.listenQueuePct },
+			func(m *Model, v float64) { m.alertRules.listenQueuePct = v }),
+		numeric("alert_listen_drops_per_min", "Listen drops", "connections the host dropped on the listen path, per minute",
+			func(m *Model) float64 { return m.alertRules.listenDropsPerMin },
+			func(m *Model, v float64) { m.alertRules.listenDropsPerMin = v }),
+		numeric("alert_close_wait", "CLOSE_WAIT", "sockets in CLOSE_WAIT held by one process",
+			func(m *Model) float64 { return float64(m.alertRules.closeWait) },
+			func(m *Model, v float64) { m.alertRules.closeWait = int(v) }),
 		{
 			key: "latency_targets", title: "Latency targets", kind: settingList,
 			help: "extra host:port probes; the gateway is always probed",
@@ -295,9 +307,9 @@ func configFileLabel() string {
 func AllColumnKeys() []string {
 	return []string{
 		"age", "closed", "conns", "container", "count", "cpu", "host", "iface",
-		"life", "listen", "local", "mem", "name", "owner", "pid", "process",
-		"procs", "proto", "remote", "rtt", "rtx", "rx", "state", "states",
-		"svc", "tx", "user",
+		"life", "listen", "local", "mem", "name", "netns", "owner", "pid",
+		"process", "procs", "proto", "queue", "remote", "rtt", "rtx", "rx",
+		"state", "states", "svc", "tx", "unit", "user",
 	}
 }
 

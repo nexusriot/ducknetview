@@ -3,7 +3,10 @@ package ui
 import (
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -46,9 +49,9 @@ func (m *Model) echoEvent(e event) {
 		return
 	}
 	line := fmt.Sprintf("%s  %-5s %-20s %s",
-		e.At.Format(time.RFC3339), e.Level.String(), e.Kind, e.Subject)
+		e.At.Format(time.RFC3339), e.Level.String(), e.Kind, printable(e.Subject))
 	if e.Detail != "" {
-		line += "  " + e.Detail
+		line += "  " + printable(e.Detail)
 	}
 	fmt.Fprintln(m.eventEcho, line)
 }
@@ -57,6 +60,7 @@ func (m *Model) echoEvent(e event) {
 // the update loop runs — ticks, polls, rates, events, alerts and the hook —
 // with nothing drawn and no terminal touched.
 func DaemonProgram(m Model) *tea.Program {
+	m.headless = true
 	p := tea.NewProgram(m,
 		tea.WithoutRenderer(),
 		tea.WithInput(nil),
@@ -66,4 +70,14 @@ func DaemonProgram(m Model) *tea.Program {
 	// headless it is never told. Sending one keeps every width positive.
 	go p.Send(tea.WindowSizeMsg{Width: daemonWidth, Height: daemonHeight})
 	return p
+}
+
+// printable escapes control characters. A process name or a PTR record is
+// chosen by someone else, and a newline in one would forge a journal line.
+func printable(s string) string {
+	if strings.IndexFunc(s, unicode.IsControl) < 0 {
+		return s
+	}
+	q := strconv.Quote(s)
+	return q[1 : len(q)-1]
 }

@@ -49,6 +49,7 @@ func aggregateByName(rows []procRow) []procRow {
 
 		agg.ConnCount += r.ConnCount
 		agg.ListenCount += r.ListenCount
+		agg.CloseWait += r.CloseWait
 		agg.CPU += r.CPU
 		agg.Mem += r.Mem
 		agg.members += r.members
@@ -61,6 +62,9 @@ func aggregateByName(rows []procRow) []procRow {
 		}
 		if agg.Container != r.Container {
 			agg.Container = mixedValue
+		}
+		if agg.Unit != r.Unit {
+			agg.Unit = mixedValue
 		}
 	}
 

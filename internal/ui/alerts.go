@@ -70,11 +70,17 @@ func (m *Model) noteThroughputAlerts(conns []probe.Conn, now time.Time) {
 			if t := m.procTotals[pid]; t != nil {
 				name = t.label
 			}
-			subject := procLabel(pid, name)
-			if subject == "" {
-				subject = fmt.Sprintf("pid %d", pid)
+			label := procLabel(pid, name)
+			if label == "" {
+				label = fmt.Sprintf("pid %d", pid)
 			}
-			key := "proc:" + subject
+			// Keyed without the unit, so a process whose unit could not be
+			// read on one poll is still the same breach rather than a new one.
+			key := "proc:" + label
+			subject := label
+			if unit := m.procUnitFor(pid); unit != "" && pid > 0 {
+				subject = procUnitLabel(pid, name, unit)
+			}
 			m.noteBreach(key, "throughput_process", subject, now)
 			if m.shouldFire(key, now) {
 				rec.add(levelAlert, "throughput_process", subject,
@@ -225,6 +231,12 @@ type alertRules struct {
 	// start but could not fire anything, which made the interface the one
 	// measured thing the tool could not tell you about.
 	ifaceDropsPerMin float64
+	// Host TCP health (see tcphealth.go): how full a listener's accept queue
+	// may get, in percent; host-wide listen drops per minute; and CLOSE_WAIT
+	// sockets held by one process.
+	listenQueuePct    float64
+	listenDropsPerMin float64
+	closeWait         int
 }
 
 func (r alertRules) any() bool {
@@ -362,6 +374,17 @@ func (m Model) procNameFor(pid int32) string {
 	}
 	if t := m.procTotals[pid]; t != nil {
 		return t.label
+	}
+	return ""
+}
+
+// procUnitFor is a PID's systemd unit from this poll's process list, "" when
+// it has none or is not in the list.
+func (m Model) procUnitFor(pid int32) string {
+	for _, p := range m.procs {
+		if p.PID == pid {
+			return p.Unit
+		}
 	}
 	return ""
 }

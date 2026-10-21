@@ -14,10 +14,16 @@ type ProcNet struct {
 	Name        string
 	ConnCount   int
 	ListenCount int
-	User        string  // owning user (best-effort)
-	Container   string  // short container id, "" when not containerised
-	CPU         float64 // percent of one core, measured since the previous poll
-	Mem         float32 // percent of physical memory (RSS)
+	// CloseWait counts sockets the peer has closed and this process has not:
+	// the kernel holds them in CLOSE_WAIT until the application calls close().
+	// A handful is transient; a count that keeps growing is the classic
+	// "never closes its sockets" bug, and eventually runs out of descriptors.
+	CloseWait int
+	User      string  // owning user (best-effort)
+	Container string  // short container id, "" when not containerised
+	Unit      string  // systemd service or scope, "" when not under systemd
+	CPU       float64 // percent of one core, measured since the previous poll
+	Mem       float32 // percent of physical memory (RSS)
 
 	// The full command line, which is the only thing that separates forty rows
 	// called "python3" from each other. Deliberately not serialised: a command
@@ -32,6 +38,7 @@ type ProcDetail struct {
 	User      string
 	Cmdline   string
 	Container string
+	Unit      string
 	Ppid      int32
 	CPU       float64
 	Mem       float32
@@ -45,6 +52,7 @@ type cpuSample struct {
 	total float64 // user+system seconds
 	at    time.Time
 	pct   float64 // percentage computed at that reading
+	valid bool    // pct came from two readings; false on a PID's first sighting
 }
 
 var (
@@ -73,7 +81,7 @@ func sampleCPU(pid int32, total float64, now time.Time) (float64, bool) {
 	defer cpuMu.Unlock()
 
 	pct, ok := cpuDelta(cpuPrev[pid], total, now)
-	cpuPrev[pid] = cpuSample{total: total, at: now, pct: pct}
+	cpuPrev[pid] = cpuSample{total: total, at: now, pct: pct, valid: ok}
 	return pct, ok
 }
 
@@ -85,7 +93,9 @@ func lastCPUPercent(pid int32) (float64, bool) {
 	defer cpuMu.Unlock()
 
 	s, ok := cpuPrev[pid]
-	if !ok || s.at.IsZero() {
+	// A first sighting has no measurement yet; reporting its placeholder 0%
+	// would contradict the table, which falls back to the lifetime average.
+	if !ok || !s.valid {
 		return 0, false
 	}
 	return s.pct, true
@@ -153,7 +163,8 @@ func ProcessDetail(pid int32) (ProcDetail, error) {
 	if err != nil {
 		return ProcDetail{}, err
 	}
-	d := ProcDetail{Container: ContainerID(pid)}
+	d := ProcDetail{}
+	d.Container, d.Unit = CgroupInfo(pid)
 	if u, e := p.Username(); e == nil {
 		d.User = u
 	}

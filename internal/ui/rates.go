@@ -46,7 +46,12 @@ func (m *Model) updateRates(conns []probe.Conn, now time.Time) {
 		}
 		prev, ok := m.prevSockBytes[key]
 		if !ok {
-			continue // first sighting: nothing to diff against yet
+			// A socket absent from the previous enumeration opened since it,
+			// so its whole counter is session traffic. Skipping it lost the
+			// first interval of every connection, and all of a short one.
+			// No rate yet: the interval it was open for is unknown.
+			m.addTotals(c, c.RxBytes, c.TxBytes, now)
+			continue
 		}
 
 		rxDelta, txDelta := deltaBytes(c.RxBytes, prev.rx), deltaBytes(c.TxBytes, prev.tx)

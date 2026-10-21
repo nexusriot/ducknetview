@@ -61,3 +61,11 @@ func normalizeHostPort(hp string) string {
 func SockKey(local, remote string) string {
 	return normalizeHostPort(local) + "|" + normalizeHostPort(remote)
 }
+
+// ListenKey is the lookup key for a listening socket's queue counters. It is
+// kept apart from SockKey because a listener has no peer: keyed by a zero
+// remote it would differ between families ("0.0.0.0:0" vs "::0") for no
+// benefit.
+func ListenKey(local string) string {
+	return "listen|" + normalizeHostPort(local)
+}

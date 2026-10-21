@@ -30,25 +30,27 @@ func exportViewCmd(m Model) tea.Cmd {
 	switch m.activeTab {
 	case tabPorts:
 		name = "ports"
-		header = []string{"proto", "local", "service", "exposure", "in_baseline", "user", "pid", "process"}
+		header = []string{"proto", "local", "service", "exposure", "in_baseline", "user", "pid", "process", "unit", "accept_queue", "backlog", "netns", "published"}
 		for _, p := range m.filteredPorts() {
 			records = append(records, []string{
 				p.Proto, p.Local, probe.ServiceName(portOf(p.Local), p.Proto),
-				probe.ListenerExposure(stripPort(p.Local)), strconv.FormatBool(!m.offBaseline(p)),
-				p.User, strconv.Itoa(int(p.PID)), p.Process,
+				p.Exposure(), strconv.FormatBool(!m.offBaseline(p)),
+				p.User, strconv.Itoa(int(p.PID)), p.Process, p.Unit,
+				strconv.FormatUint(uint64(p.AcceptQueue), 10), strconv.FormatUint(uint64(p.Backlog), 10),
+				netnsLabel(p.NetNS), p.Published,
 			})
 		}
 	case tabProcs:
 		name = "processes"
-		header = []string{"pid", "processes", "name", "user", "container", "cpu_percent", "mem_percent", "rx_bps", "tx_bps", "conns", "listen"}
+		header = []string{"pid", "processes", "name", "user", "container", "unit", "cpu_percent", "mem_percent", "rx_bps", "tx_bps", "conns", "listen", "close_wait"}
 		for _, p := range m.filteredProcs() {
 			r := m.rowRate(p)
 			records = append(records, []string{
-				strconv.Itoa(int(p.PID)), strconv.Itoa(p.members), p.Name, p.User, p.Container,
+				strconv.Itoa(int(p.PID)), strconv.Itoa(p.members), p.Name, p.User, p.Container, p.Unit,
 				strconv.FormatFloat(p.CPU, 'f', 1, 64),
 				strconv.FormatFloat(float64(p.Mem), 'f', 1, 32),
 				strconv.FormatFloat(r.rx, 'f', 0, 64), strconv.FormatFloat(r.tx, 'f', 0, 64),
-				strconv.Itoa(p.ConnCount), strconv.Itoa(p.ListenCount),
+				strconv.Itoa(p.ConnCount), strconv.Itoa(p.ListenCount), strconv.Itoa(p.CloseWait),
 			})
 		}
 	case tabConns:
@@ -117,6 +119,11 @@ func exportViewCmd(m Model) tea.Cmd {
 		}
 		defer f.Close()
 
+		for _, rec := range records {
+			for i := range rec {
+				rec[i] = csvSafe(rec[i])
+			}
+		}
 		w := csv.NewWriter(f)
 		_ = w.Write(header)
 		_ = w.WriteAll(records)
@@ -131,4 +138,23 @@ func exportViewCmd(m Model) tea.Cmd {
 		}
 		return exportResultMsg{path: abs}
 	}
+}
+
+// csvSafe defuses a cell a spreadsheet would evaluate as a formula. Several
+// columns are chosen by other people — a PTR record by whoever owns the remote
+// address, a process name by any local user — and "=HYPERLINK(…)" in one runs
+// when the export is opened. A leading apostrophe makes it text. A bare "-"
+// placeholder and plain numbers are left alone.
+func csvSafe(v string) string {
+	if v == "" || v == "-" {
+		return v
+	}
+	switch v[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		if _, err := strconv.ParseFloat(v, 64); err == nil {
+			return v
+		}
+		return "'" + v
+	}
+	return v
 }

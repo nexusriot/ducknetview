@@ -63,6 +63,11 @@ type config struct {
 	AlertFanoutHosts   int     `json:"alert_fanout_hosts,omitempty"`
 	// Link health: errors and drops per minute on one interface.
 	AlertIfaceDropsPerMin float64 `json:"alert_iface_drops_per_min,omitempty"`
+	// Host TCP health: a listener's accept queue fill in percent, host-wide
+	// listen drops per minute, and CLOSE_WAIT sockets held by one process.
+	AlertListenQueuePct    float64 `json:"alert_listen_queue_pct,omitempty"`
+	AlertListenDropsPerMin float64 `json:"alert_listen_drops_per_min,omitempty"`
+	AlertCloseWait         int     `json:"alert_close_wait,omitempty"`
 
 	// Appearance and interaction.
 	Theme       string            `json:"theme,omitempty"`
@@ -136,6 +141,9 @@ func (m *Model) applyConfig() {
 	m.connsGroup = c.ConnsGroup
 	m.showTotals = c.ShowTotals
 	m.aggregateProcs = c.AggProcs
+	// Every setting is assigned whether or not the file has it: this also
+	// runs on SIGHUP, and a key deleted from the file has to stop applying.
+	m.hiddenCols = nil
 	if len(c.HiddenColumns) > 0 {
 		hidden := make(map[string]bool, len(c.HiddenColumns))
 		for _, key := range c.HiddenColumns {
@@ -143,6 +151,7 @@ func (m *Model) applyConfig() {
 		}
 		m.hiddenCols = hidden
 	}
+	m.rateUnit = probe.UnitBytes
 	if c.RatesInBits {
 		m.rateUnit = probe.UnitBits
 	}
@@ -153,6 +162,7 @@ func (m *Model) applyConfig() {
 	m.publicOnly = c.PublicOnly
 	m.onlyMine = c.OnlyMine
 	m.activeTab = tab(clampInt(c.LastTab, 0, tabCount-1))
+	m.searchMode = searchFilter
 	if c.SearchHighlight {
 		m.searchMode = searchHighlight
 	}
@@ -178,6 +188,10 @@ func (m *Model) applyConfig() {
 		connGrowth:       max(0, c.AlertConnGrowth),
 		fanoutHosts:      max(0, c.AlertFanoutHosts),
 		ifaceDropsPerMin: maxFloat(0, c.AlertIfaceDropsPerMin),
+
+		listenQueuePct:    maxFloat(0, c.AlertListenQueuePct),
+		listenDropsPerMin: maxFloat(0, c.AlertListenDropsPerMin),
+		closeWait:         max(0, c.AlertCloseWait),
 	}
 
 	// An unknown theme name falls back to the default rather than rendering
@@ -193,6 +207,7 @@ func (m *Model) applyConfig() {
 	m.asnPath = c.ASNDatabase
 	m.loadASNDB()
 
+	m.baseline, m.baselineRaw, m.baselineAt = nil, nil, time.Time{}
 	if len(c.Baseline) > 0 {
 		set := make(map[string]bool, len(c.Baseline))
 		for _, k := range c.Baseline {
@@ -213,6 +228,12 @@ func (m Model) saveConfig() {
 	// config we never managed to parse with this session's defaults, which
 	// silently deletes every hand-written setting in it.
 	if m.configUnsafe {
+		return
+	}
+	// A headless session has no keyboard, so nothing it holds is newer than
+	// the file. Writing it back on stop only reverted whatever an admin had
+	// edited since the last SIGHUP.
+	if m.headless {
 		return
 	}
 	c := config{
@@ -251,6 +272,10 @@ func (m Model) saveConfig() {
 		AlertConnGrowth:       m.alertRules.connGrowth,
 		AlertFanoutHosts:      m.alertRules.fanoutHosts,
 		AlertIfaceDropsPerMin: m.alertRules.ifaceDropsPerMin,
+
+		AlertListenQueuePct:    m.alertRules.listenQueuePct,
+		AlertListenDropsPerMin: m.alertRules.listenDropsPerMin,
+		AlertCloseWait:         m.alertRules.closeWait,
 
 		Theme:       m.theme,
 		Keys:        m.keymap.overrides(),

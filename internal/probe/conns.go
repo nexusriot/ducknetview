@@ -15,6 +15,7 @@ type Conn struct {
 	PID     int32
 	Process string
 	User    string
+	NetNS   string `json:",omitempty"` // as ListenPort.NetNS
 
 	// Cumulative kernel counters and health for this socket, from SockStats.
 	// TCP-only and Linux-only; zero when unavailable.
@@ -39,7 +40,11 @@ func isActive(c gnet.ConnectionStat) bool {
 	if c.Type == syscall.SOCK_STREAM && c.Status == "LISTEN" {
 		return false
 	}
-	if c.Raddr.IP == "" && c.Raddr.Port == 0 {
+	// An unconnected socket has no peer. gopsutil renders its all-zero remote
+	// as "0.0.0.0" or "::" rather than "", so the port is what tells: no real
+	// peer is ever on port 0. Testing the IP for "" let every bound UDP socket
+	// through as a "connection" to 0.0.0.0:0.
+	if c.Raddr.Port == 0 {
 		return false
 	}
 	return true

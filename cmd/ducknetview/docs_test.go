@@ -147,9 +147,10 @@ func TestEveryMetricIsDocumented(t *testing.T) {
 	snap := probe.NetSnapshot{
 		Hostname: "docs", TakenAt: time.Now(),
 		Ifaces: []probe.IfaceInfo{{Name: "eth0", IsUp: true}},
+		TCP:    &probe.TCPHealth{},
 	}
 	info := probe.ConnInfo{
-		Ports: []probe.ListenPort{{Proto: "tcp", Local: "0.0.0.0:22", PID: 1, Process: "sshd"}},
+		Ports: []probe.ListenPort{{Proto: "tcp", Local: "0.0.0.0:22", PID: 1, Process: "sshd", Backlog: 128}},
 		Procs: []probe.ProcNet{{PID: 1, Name: "sshd"}},
 		Conns: []probe.Conn{{Proto: "tcp", Local: "10.0.0.2:1", Remote: "8.8.8.8:443"}},
 	}

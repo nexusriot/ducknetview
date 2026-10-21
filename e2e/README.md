@@ -26,8 +26,9 @@ the container. The one thing it needs is a working Docker.
 |------|---------------|
 | `probe.SockStats` | Per-socket byte counters and RTT come from a netlink dump of a real kernel. The fixture writes ~90 kB and the counters have to show it |
 | `probe.Collect` | Attributing a socket to a PID means reading `/proc/<pid>/fd` for every process |
+| Other network namespaces | The suite re-executes itself into a fresh network namespace (`CLONE_NEWNET`) and the snapshot taken from outside has to list its listener and connection — labelled, classed `netns` rather than exposed, with byte counters read by `sock_diag` after `setns`. `run.sh` grants the container `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` for this; without them the test skips |
 | `probe.Routes` / `Neighbours` / `Resolvers` | Parsers for files only a real host has |
-| Every non-interactive mode | `--json`, `--once`, `--metrics`, `--top`, `--diff`, `--check-baseline`, `--save-baseline`, `--check-config`, `--usage`, `--from`, `--version` — each is a process that has to start, do its job and exit with the right code |
+| Every non-interactive mode | `--json`, `--once`, `--metrics`, `--top`, `--diff`, `--check-baseline`, `--save-baseline`, `--check-config`, `--usage-all`, `--from` (a snapshot file; `ssh://` is not exercised), `--version` — each is a process that has to start, do its job and exit with the right code |
 | `--daemon` | Polling, event detection, the alert rules and their recovery, the hook, `SIGHUP` reload and a clean `SIGTERM` only happen in a long-running process |
 | `--metrics-listen` | The exporter is answered from the live session's own state, over HTTP |
 | The TUI | Bubble Tea takes the terminal into raw mode and reads keys from it, so the suite drives it on a real pseudo-terminal (`pty_linux.go`, a dozen ioctls rather than a dependency) |
@@ -43,6 +44,7 @@ util_test.go     assertions shared across the suite, incl. a Prometheus parser
 cli_test.go      the non-interactive modes
 daemon_test.go   the daemon, the exporter, the event log and the alert hook
 tui_test.go      the TUI, driven on a pty
+netns_test.go    sockets in another network namespace (a container, minus the runtime)
 pty_linux.go     the pseudo-terminal itself
 ```
 

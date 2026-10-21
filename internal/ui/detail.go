@@ -95,11 +95,19 @@ func (m Model) detailContent() (string, bool) {
 		kv("Protocol", p.Proto)
 		kv("Local", local)
 		if local != "-" {
-			kv("Exposure", probe.ListenerExposure(stripPort(p.Local)))
+			kv("Exposure", p.Exposure())
+		}
+		if p.NetNS != "" {
+			kv("Netns", p.NetNS)
+			kv("Published", p.Published)
 		}
 		kv("Service", probe.ServiceName(portOf(p.Local), p.Proto))
 		if m.offBaseline(p) {
 			kv("Baseline", "NOT IN BASELINE")
+		}
+		if ratio, ok := p.QueueRatio(); ok {
+			kv("Accept q", queueStyle(ratio).Render(fmt.Sprintf("%d waiting of %d backlog (%.0f%%)",
+				p.AcceptQueue, p.Backlog, ratio*100)))
 		}
 		kv("PID", fmt.Sprintf("%d", p.PID))
 		kv("Process", p.Process)
@@ -122,6 +130,7 @@ func (m Model) detailContent() (string, bool) {
 		}
 		kv("User", p.User)
 		kv("Container", p.Container)
+		kv("Unit", p.Unit)
 		kv("CPU %", fmt.Sprintf("%.1f", p.CPU))
 		kv("Mem %", fmt.Sprintf("%.1f", p.Mem))
 		if m.hasThroughput {
@@ -133,6 +142,13 @@ func (m Model) detailContent() (string, bool) {
 		}
 		kv("Conns", fmt.Sprintf("%d", p.ConnCount))
 		kv("Listening", fmt.Sprintf("%d", p.ListenCount))
+		closeWait := fmt.Sprintf("%d", p.CloseWait)
+		if p.CloseWait > 0 {
+			// Closed by the peer, never by this process: worth a second look
+			// even below any alert threshold.
+			closeWait = warnStyle.Render(closeWait + " (peer closed, process has not)")
+		}
+		kv("CloseWait", closeWait)
 		if p.members <= 1 {
 			if d, err := probe.ProcessDetail(p.PID); err == nil {
 				kv("PPID", fmt.Sprintf("%d", d.Ppid))
@@ -151,6 +167,9 @@ func (m Model) detailContent() (string, bool) {
 			b.WriteString(titleStyle.Render("Closed connection") + "\n\n")
 			kv("Protocol", c.Proto)
 			kv("Local", c.Local)
+			if c.NetNS != "" {
+				kv("Netns", c.NetNS)
+			}
 			kv("Remote", m.dnsDisplay(c.Remote))
 			kv("Scope", probe.IPScope(stripPort(c.Remote)))
 			if owner := m.ownerDetail(c.Remote); owner != "" {
@@ -207,6 +226,9 @@ func (m Model) detailContent() (string, bool) {
 			b.WriteString(titleStyle.Render("Connection") + "\n\n")
 			kv("Protocol", c.Proto)
 			kv("Local", c.Local)
+			if c.NetNS != "" {
+				kv("Netns", c.NetNS)
+			}
 			kv("Remote", m.dnsDisplay(c.Remote))
 			kv("Scope", probe.IPScope(stripPort(c.Remote)))
 			if owner := m.ownerDetail(c.Remote); owner != "" {
@@ -278,7 +300,7 @@ func writeRateSparks(b *strings.Builder, h *rateHistory, width int) {
 		Spark(h.tx, chartW) + "  " + subtleStyle.Render("peak "+probe.CompactRate(maxOf(h.tx))) + "\n")
 }
 
-// writeProcDetail appends the owning user, container and command line for a
+// writeProcDetail appends the owning user, container, unit and command line for a
 // PID, fetched on demand (skipped silently if the process is gone or
 // unreadable).
 func writeProcDetail(b *strings.Builder, kv func(k, v string), pid int32) {
@@ -292,6 +314,9 @@ func writeProcDetail(b *strings.Builder, kv func(k, v string), pid int32) {
 	kv("User", d.User)
 	if d.Container != "" {
 		kv("Container", d.Container)
+	}
+	if d.Unit != "" {
+		kv("Unit", d.Unit)
 	}
 	kv("Command", d.Cmdline)
 }

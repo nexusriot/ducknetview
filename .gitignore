@@ -1,5 +1,5 @@
 .idea/
 build/
 cmd/ducknetview/ducknetview
-ducknetview
+/ducknetview
 coverage.out

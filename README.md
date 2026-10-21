@@ -2,7 +2,7 @@
 
 Minimalistic **network monitoring TUI** written in **Go**.
 
-Current version: **0.5.1** — see [CHANGELOG.md](CHANGELOG.md) for what changed,
+Current version: **0.6.0** — see [CHANGELOG.md](CHANGELOG.md) for what changed,
 and [ROADMAP.md](ROADMAP.md) for what might come next.
 
 Built with:
@@ -32,11 +32,12 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - **Path latency** — TCP-handshake round trip to the default gateway (and any extra targets in the config), with a short history each. A dual-stack host gets both first hops, as `gateway` and `gateway6`: they are frequently not the same box. A link-local IPv6 next hop is probed with its zone (`fe80::1%eth0`), without which it is not dialable at all
     - **Top talkers (session)** — the processes and remote hosts that have moved the most data since launch, with the session grand total
     - **Connection churn** — connections opened and closed per poll, as a chart. A spike is how a leak or a scan announces itself
+    - **Host TCP** — host-wide counters from `/proc/net/snmp` and `/proc/net/netstat`, as per-minute rates: listen overflows and drops (connections the kernel refused because a service's accept queue was full — they never become a row anywhere else), SYN cookies sent, retransmitted segments, retransmit timeouts, bad segments received and resets sent. Only the counters that are moving are listed, and the problem ones are highlighted
     - **Last 24 hours** — per-minute throughput peaks kept on disk, so "when did that spike happen" is still answerable after a restart. Every other chart in the tool dies with the session
     - Panels appear once they have something to say, and step aside on a terminal too short to hold them
     - Selected interface summary with RX/TX rate, cumulative RX/TX totals, and sparkline charts
     - **Total throughput** across all real interfaces (loopback excluded) with current + session-peak RX/TX and sparklines
-    - **External IP** (fetched from `api.ipify.org`, auto-refreshed every 30 s, manual refresh with `ctrl+e`)
+    - **External IP** (fetched from `api.ipify.org`, auto-refreshed every 30 s, manual refresh with `ctrl+e`; the TUI only — `--daemon` never contacts it)
     - The "Selected interface" is whichever interface is highlighted on the **Interfaces** tab (defaults to the first interface until you pick one)
 
 - **Interfaces tab**
@@ -51,31 +52,33 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
 - **Ports tab**
     - Open listening TCP / UDP ports
     - PID and process name (best-effort)
-    - Bind addresses are **colored by exposure**: orange = reachable off-host (`0.0.0.0`/`::` or a routable address), amber = private/LAN, dim = loopback
+    - Bind addresses are **colored by exposure**: orange = reachable off-host (`0.0.0.0`/`::` or a routable address), amber = private/LAN or inside a container's own network namespace, dim = loopback. A container's `0.0.0.0` is only orange when a `docker-proxy` on the host publishes it
+    - **Listeners inside containers** and other network namespaces are listed too, with a **NETNS** column (container id, `ip netns` name, or `netns:<inode>`; `host` for ducknetview's own) that appears once there is more than one namespace. Search by it to filter to one container. See [Network namespaces](#network-namespaces)
     - Listeners that **appeared since the last poll** are highlighted (green protocol) with a count in the header — a new listener can signal a backdoor or a regression
     - **Service name** column (well-known ports, e.g. `443 → https`, from `/etc/services` with a built-in fallback)
-    - **USER** column showing each listener's owning user
+    - **USER** column showing each listener's owning user, and a **UNIT** column with the owning process's systemd service or scope (`nginx.service`, `session-2.scope`) that appears when any listener has one
+    - **QUEUE column** — a TCP listener's accept queue as `waiting/backlog` (Linux, from the same `sock_diag` dump as the throughput counters), amber from half full and red near the limit. A full queue is a service that is not calling `accept()` fast enough: the handshakes are done and the connections are dropped before the application ever sees them. The detail overlay shows the fill as a percentage; the column does not exist where the kernel cannot report it
     - **Baseline** — press `b` to record the current listeners as the expected set; anything outside it is flagged in red on the protocol cell, counted in the header and on the Overview, and reported by `--check-baseline`. `a` accepts just the highlighted listener into the baseline (and takes it back out), which is what you want when one new service is fine but the rest of the diff is not; `B` clears the baseline
     - **`F` follows the highlighted listener into the connections it is serving**, which is how you find out who is actually using a service
     - Selectable list (`↑↓` moves a row cursor); copy the highlighted row with `y`
-    - **Sortable** (`s` cycles `proto → port → pid → process → user`, `S` reverses)
-    - Search (`/`) by port, address, protocol, service, user or process name
+    - **Sortable** (`s` cycles `proto → port → pid → process → user → unit → queue`, `S` reverses; queue sorts by how full, not how long)
+    - Search (`/`) by port, address, protocol, service, user, unit, process name or network namespace
 
 - **Processes tab**
     - Processes ranked by network connection count (top 80)
-    - Connection count, listening-socket count, and **CPU% / memory%** per process (CPU is measured over the poll interval, not averaged over the process lifetime)
+    - Connection count, listening-socket count, and **CPU% / memory%** per process. The detail overlay adds the number of sockets in **CLOSE_WAIT** — closed by the peer, never by the process — which is how the classic "never closes its sockets" bug looks before it runs out of descriptors (CPU is measured over the poll interval, not averaged over the process lifetime)
     - **RX / TX throughput** per process, summed across its connections — press `t` to swap the columns between the current rate and the **session total** (the sort keys follow the mode)
-    - **USER** column, and a **CONTAINER** column that appears when any process is running in a container (docker / podman / containerd / CRI-O / LXC)
+    - **USER** column, a **CONTAINER** column that appears when any process is running in a container (docker / podman / containerd / CRI-O / LXC), and a **UNIT** column — the systemd service or scope the process runs in, the innermost one under a user manager (`pipewire.service` rather than `user@1000.service`) — that appears when any process has one
     - **`A` folds processes that share a name into one row** — a browser is forty processes, and the useful row is their sum. Counts, CPU, memory and throughput add up; columns whose members disagree (different users, say) show `*`
     - Selectable list (`↑↓` moves a row cursor); copy the highlighted row with `y`
     - **`T` arranges the rows as a tree** of what started what, which answers the question `A` cannot: a stray `curl`, a worker under its supervisor, a shell under a session. A process whose parent holds no sockets is a root rather than a hidden row, so nothing disappears
     - **`F` follows the highlighted process into its connections** — you can see it moving 40 MB/s, and this is where to. A folded row follows every PID it stands for
-    - **Sortable** (`s` cycles `conns → listen → cpu → mem → rx → tx → pid → name → user`, `S` reverses)
-    - Search (`/`) by process name, **command line**, PID, user or container id — the command line is what separates forty rows called `python3`, and searching a container id doubles as a per-container filter. The command line is shown in the row detail overlay and is deliberately never serialised: a `--json` snapshot gets piped around, and an argument list can carry a password
+    - **Sortable** (`s` cycles `conns → listen → cpu → mem → rx → tx → pid → name → user → unit`, `S` reverses)
+    - Search (`/`) by process name, **command line**, PID, user, container id or unit — the command line is what separates forty rows called `python3`, and searching a container id or a unit doubles as a per-container or per-service filter. The command line is shown in the row detail overlay and is deliberately never serialised: a `--json` snapshot gets piped around, and an argument list can carry a password
     - Unprivileged, sockets belonging to other users arrive with no PID at all and cannot be named or signalled. The tab says how many rather than leaving a column of dashes to look like a bug, and the count is recorded once per session as an `attribution_limited` event so a headless log explains its own gaps
 
 - **Connections tab**
-    - All active (non-listening) TCP/UDP connections
+    - All active (non-listening) TCP/UDP connections, including those inside containers' network namespaces (NETNS column, searchable, as on the Ports tab)
     - Local / remote address, resolved **service**, state, PID, process
     - **RX / TX throughput per connection**, read from the kernel's own per-socket counters (Linux; TCP only). The columns are hidden entirely where the platform can't account for sockets. `t` swaps them for cumulative totals
     - **RTT and RTX columns** — smoothed round-trip time and the socket's lifetime retransmit count, both sortable. Retransmits mean loss on the path; a standing send queue (in the detail overlay) means the peer isn't draining what you hand it — together they separate "the network is bad" from "the server is slow"
@@ -91,7 +94,7 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - **OWNER column** — the autonomous system behind each public address, when an `asn_database` is configured. rDNS is silent for most cloud addresses, and "who is 13.107.42.14" otherwise means another tool. Sortable, so the view groups by provider
     - **`F` goes back** to the process or listener this view was opened from (see below)
     - Selectable list (`↑↓` moves a row cursor); copy the highlighted row (or group) with `y`
-    - **Sortable** (`s` cycles `pid → proto → state → local → remote → process → scope → age → rx → tx → rtt → retrans`, or `conns → host → bytes` in grouped view; `S` reverses)
+    - **Sortable** (`s` cycles `pid → proto → state → local → remote → process → scope → age → rx → tx → rtt → retrans → owner`, or `conns → host → bytes` in grouped view and `closed → bytes → lifetime → process → remote` in the closed-connections view; `S` reverses)
     - Search (`/`) by local / remote address (raw IP or resolved name), process, service, state or protocol
 
 - **Routes tab**
@@ -103,33 +106,36 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - A timestamped log of what *changed*, which the live tables can't show you: listeners appearing and disappearing, watchlist hits, the first connection to each new public host, and interfaces going up, down, appearing or vanishing
     - Levels are colour-coded (info / warn / **alert**) and the tab label carries an alert count, so a new listener is visible from any other tab
     - `/` searches the log and `l` cycles a level filter (all / warn and above / alerts only)
-    - **Thresholds and rules**, all opt-in through the config, each firing at most once a minute per subject: throughput per process or per connection (`alert_process_bps`, `alert_connection_bps`), round-trip time (`alert_rtt_ms`), retransmits per minute on one socket (`alert_retrans_per_min`), a process whose connection count only ever grows (`alert_conn_growth_polls` — a leak), a process reaching many new hosts at once (`alert_fanout_hosts` — what a scan looks like from the inside), and errors or drops on a link (`alert_iface_drops_per_min`, measured as a rate because the counters are cumulative since boot). With `--on-alert` each alert also runs a command of your choosing
+    - **Thresholds and rules**, all opt-in through the config, each firing at most once a minute per subject: throughput per process or per connection (`alert_process_bps`, `alert_connection_bps`), round-trip time (`alert_rtt_ms`), retransmits per minute on one socket (`alert_retrans_per_min`), a process whose connection count only ever grows (`alert_conn_growth_polls` — a leak), a process reaching many new hosts at once (`alert_fanout_hosts` — what a scan looks like from the inside), errors or drops on a link (`alert_iface_drops_per_min`, measured as a rate because the counters are cumulative since boot), a listener's accept queue filling up (`alert_listen_queue_pct`), the host dropping connections on the listen path (`alert_listen_drops_per_min`) and a process holding many sockets in CLOSE_WAIT (`alert_close_wait`). With `--on-alert` each alert also runs a command of your choosing
+    - **Daemon-friendly subjects** — `listener_up`, `listener_down`, `listener_moved` and `throughput_process` name the systemd unit beside the PID (`pid 812 (nginx, nginx.service)`), because by the time anyone reads a daemon's log the PID has changed and the unit is what they know the service by
+    - **`baseline_drift`** — the first poll is deliberately silent, so a daemon restarted onto a host already listening outside its baseline would otherwise say nothing about it. With a baseline saved, the first poll of a session raises one **alert** naming the off-baseline listeners (the first five, then "N more"), so `--on-alert` fires for drift that predates the session
     - **`listener_moved`** — a service that disappears and reappears on the same port under the same process is reported as one event rather than two, and as an **alert** when the move widens its exposure (`127.0.0.1:5432` → `0.0.0.0:5432` is the case worth catching)
-    - **Recovery is reported too**: every sustained rule — throughput, round-trip time, retransmits, link errors — raises a matching `*_cleared` event once its subject has been back under the threshold for a minute, including when the subject went away entirely because the transfer finished or the process exited. Without it a hook is paged and never cleared, and the log records a beginning with no end
+    - **Recovery is reported too**: every sustained rule — throughput, round-trip time, retransmits, link errors, accept queues, listen drops, CLOSE_WAIT — raises a matching `*_cleared` event once its subject has been back under the threshold for a minute, including when the subject went away entirely because the transfer finished or the process exited. Without it a hook is paged and never cleared, and the log records a beginning with no end
     - `d` acknowledges alerts: the tab badge clears without destroying the log
     - Holds the most recent 500 events in memory; `c` clears them, `e` exports them to CSV, and `--log-events` writes every event to a file as it happens
     - One poll can contribute at most 20 events per kind, with an explicit "N more … suppressed" entry so truncation is never silent
 
-- **Row details & actions** (Ports / Processes / Connections / Events)
-    - Press `enter` for a full detail overlay of the highlighted row (protocol, addresses, resolved service, exposure/scope, watchlist status, baseline status, age, throughput and RTT, and the owning process's user / container / PPID / command line / CPU / memory). Long command lines wrap instead of being cut off; `↑↓` scrolls, `y` copies it as plain text, and it keeps updating while open
+- **Row details & actions** (`enter` and `e` on Ports / Processes / Connections / Events; `x` on Ports / Processes / Connections)
+    - Press `enter` for a full detail overlay of the highlighted row (protocol, addresses, resolved service, exposure/scope, watchlist status, baseline status, age, throughput and RTT, and the owning process's user / container / systemd unit / PPID / command line / CPU / memory). Long command lines wrap instead of being cut off; `↑↓` scrolls, `y` copies it as plain text, and it keeps updating while open
     - Press `x` to signal the highlighted row's process — the confirmation offers `t` SIGTERM · `k` SIGKILL · `h` SIGHUP (may need privileges)
     - Press `e` to export the current (filtered / sorted) table to a timestamped CSV in the working directory
 
 - **Headless and scriptable**
     - **`ducknetview --daemon`** runs the whole model with nothing drawing it: the same polling, the same rates, the same event detection and the same alert rules, writing events to stdout and stopping cleanly on `SIGTERM`. Everything the alerting does was previously only running while somebody was watching the TUI, which is backwards — the moment you stop watching is the moment you want to be told. **`SIGHUP` re-reads the config in place**, keeping the session totals, the event ring and the rate baselines that a restart would throw away; the reload is itself logged as a `config_reloaded` event, at warning level when part of the new config had to be ignored
     - **`ducknetview --metrics-listen :9847`** serves the Prometheus metrics over HTTP at `/metrics` instead of (or as well as) writing a textfile, so a scraper can reach them directly. It is **answered from the running session's own state** rather than by sampling the host again, which makes a scrape sub-millisecond instead of a second — and exports what only a running session knows: **seconds since the last completed poll** (the one metric that reveals a monitor which is up but no longer working), polls and events by kind, the session's accumulated byte totals, alerts raised and alert hooks that failed. It binds a socket, so give it an explicit address like `127.0.0.1:9847` unless the exporter should really be reachable from the network. Works alongside the TUI or the daemon
-    - **`ducknetview --check-config`** reports everything wrong with the config at once and exits non-zero. The loader is deliberately forgiving so a hand-edited file can never wedge the interface — and the cost of that is silence: a watchlist regex that does not compile, a latency target with no port, a hidden column key that names nothing, a binding for an action that does not exist and a misspelt key all simply do nothing, for ever. Exits `1` when anything is being ignored, `2` when the file cannot be read at all
+    - **`ducknetview --check-config`** reports everything wrong with the config at once and exits non-zero. The loader is deliberately forgiving so a hand-edited file can never wedge the interface — and the cost of that is silence: a watchlist regex that does not compile, a latency target with no port, a hidden column key that names nothing, a binding for an action that does not exist and a misspelt key all simply do nothing, for ever. Exits `1` when anything is being ignored, `2` when the file cannot be read at all. Problems that do not disable anything are reported as **warnings** and do not fail the check: a key that differs from the documented one only in case (the loader matches keys case-insensitively, so it is applied), and a latency target that does not resolve right now (DNS may simply not be up yet at boot)
     - **`ducknetview --diff old.json new.json`** reports what changed between two snapshots — listeners gained and lost, processes that appeared, remote hosts contacted for the first time, links that went away — and exits `1` when anything differs, like `diff(1)`. Processes are compared by name, so a restart is not a change; listeners are keyed by bind address, so a service moving from `127.0.0.1` to `0.0.0.0` shows up as exactly that
     - `ducknetview --once` prints a one-shot text snapshot (interfaces, ports, connections) and exits; `--json` emits a fuller snapshot (also including processes, routes, neighbours, resolvers, Wi-Fi and one gateway latency probe) as JSON for scripting
     - `ducknetview --check-baseline` compares the host's listeners against the saved baseline and exits **1** if any are unexpected (**0** when clean, **2** when no baseline has been saved) — enough for cron or a monitoring check
     - `ducknetview --save-baseline FILE` writes a **portable baseline**; `--check-baseline --baseline FILE` checks against it. Build one on a known-good host and ship it to the fleet
-    - `ducknetview --tab conns` opens straight onto a tab; `ducknetview --view vpn` opens into a saved view (below), and the two compose
+    - `ducknetview --tab conns` opens straight onto a tab; `ducknetview --view vpn` opens into a saved view (below), and the two compose. An explicitly empty `--view ''` prints the saved view names, one per line, and exits — the shell completions use it
     - `ducknetview --from snap.json` browses a `--json` snapshot instead of the live host, frozen and clearly marked. `-` reads stdin, so `ssh host ducknetview --json | ducknetview --from -` browses a remote host with no agent to install. Because the snapshot now carries the host's routing configuration, the Routes tab describes the remote machine rather than explaining why it cannot
     - **`ducknetview --from ssh://host` is the live version of that**: the same command is re-run on the refresh interval, and since two consecutive snapshots carry the same cumulative counters a local poll would, throughput, session totals, the event log and every alert rule work on the far host. Still nothing installed there but the binary. A failed fetch leaves the last view in place and marks the header stale rather than ending the session
     - `ducknetview --metrics` prints the host's network state in Prometheus text format, for a node_exporter textfile directory
     - `ducknetview --top 10` prints the busiest processes and hosts and exits
     - `ducknetview --usage 7` prints the recorded daily traffic totals (`--usage-all` for everything kept)
     - `ducknetview --version` prints the version
+    - Every mode exits **2** on a usage error (an unknown `--tab` or `--view`, a stray argument, `--daemon` with `--from`) or when the host cannot be read
 
 - **Refresh control**
     - `space` pauses / resumes auto-refresh (a `⏸ PAUSED` marker shows in the header)
@@ -137,7 +143,7 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - `R` refreshes everything immediately
 
 - **Daily usage history**
-    - Each session's totals are merged into `usage.json` on exit, per day, keeping 40 days and the 50 biggest processes and hosts per day — enough to answer "where did this month's data go" without keeping a database
+    - Traffic is merged into `usage.json` every five minutes and on exit, booked against the day it was flushed on — so a long-running daemon spreads its traffic over the right days, and a crash loses at most five minutes of it. Per day, keeping 40 days and the 50 biggest processes and hosts per day — enough to answer "where did this month's data go" without keeping a database
 
 - **Search**
     - On the Processes tab the search covers the **command line** as well as the name, which is the only thing separating forty rows called `python3` from each other. It is never written to a snapshot, a CSV or the event log: a command line can carry a password, and a `--json` snapshot gets piped around
@@ -150,7 +156,7 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - They live in the config, so `ducknetview --view vpn` opens straight into one from a shell alias or a unit file. A drill is deliberately not recorded: it points at PIDs that will not exist next time
 
 - **Settings overlay (`,`)**
-    - The six alert thresholds, the latency targets, the hidden columns and the theme had no key binding at all: the only way to discover them was to read this file, and the only way to set one was to quit, edit JSON and start again. The overlay edits all of them in place and writes the config as it goes
+    - The ten alert thresholds, the latency targets, the hidden columns and the theme had no key binding at all: the only way to discover them was to read this file, and the only way to set one was to quit, edit JSON and start again. The overlay edits all of them in place and writes the config as it goes
     - Numbers take `off` or an empty value to disable; list rows add a value, or remove it when given the same value again; invalid input says why instead of being silently dropped
 
 - **Themes and key bindings**
@@ -158,7 +164,7 @@ The focus is a clean, usable terminal UI even on hosts with many interfaces (Doc
     - `keys` rebinds any of the 39 actions: `"closed": "Z"`. An unknown action, a reserved key (`ctrl+c`, `tab`, the arrows, the digits) or a key another action already owns is ignored rather than obeyed, so a bad config cannot leave the tool unusable — and the help overlay renders what is actually bound
 
 - **Persisted settings**
-    - Sort keys/direction, the hide-noise / reverse-DNS / grouping / totals / tree toggles, the quick filters, the search mode, the refresh interval, the last open tab, the theme, the key bindings, the saved views and the listener baseline are saved to `${XDG_CONFIG_HOME:-~/.config}/ducknetview/config.json` as you change them and restored on next launch
+    - Sort keys/direction, the hide-noise / reverse-DNS / grouping / totals / tree toggles, the quick filters, the search mode, the refresh interval, the last open tab, the theme, the key bindings, the saved views and the listener baseline are saved to `ducknetview/config.json` under the user config directory (`${XDG_CONFIG_HOME:-~/.config}` on Linux, `~/Library/Application Support` on macOS) as you change them and restored on next launch. A `--daemon` session has no keyboard and never writes the file, so edits made while it runs are not reverted when it stops
 
 Interface counters are sampled on the chosen interval (default every second). The ports, processes and connections views are all derived from a **single socket enumeration** (one `gopsutil` pass feeds all three, with shared process-name, user and container caches). Enumeration follows the chosen refresh interval but never runs more often than every 2 seconds, since it costs roughly twenty times an interface sample.
 
@@ -183,9 +189,9 @@ Press `?` at any time for an in-app key-binding overlay. The mouse is supported 
 | `enter`              | Show a detail overlay for the highlighted row (`↑↓` scrolls it, `y` copies it, any other key closes it) |
 | `y`                  | Copy the highlighted row / selected interface to the clipboard |
 | `e`                  | Export the current table view to a CSV file |
-| `x`                  | Signal the highlighted row's process — confirm with `t`/`k`/`h` (TERM/KILL/HUP) |
-| `space`              | Pause / resume auto-refresh |
-| `+` / `-`            | Faster / slower refresh interval |
+| `x`                  | Signal the highlighted row's process (Ports / Processes / Connections) — confirm with `t`/`k`/`h` (TERM/KILL/HUP) |
+| `space`              | Pause / resume auto-refresh (also in a live `--from ssh://` session) |
+| `+` / `-`            | Faster / slower refresh interval (`=` and `_` also work, unshifted) |
 | `R`                  | Refresh everything now |
 | `t`                  | Throughput columns: current rate / session total |
 | `U`                  | Rates in bytes/s or bits/s |
@@ -209,7 +215,7 @@ Press `?` at any time for an in-app key-binding overlay. The mouse is supported 
 
 | Key            | Action |
 |----------------|--------|
-| `↑ ↓`          | Move the row cursor (or scroll the interface list) |
+| `↑ ↓` / `k j`  | Move the row cursor (or scroll the interface list) |
 | `PgUp / PgDn`  | Move the cursor by a page |
 | `Home / End`   | Jump to first / last row |
 | mouse click    | Select the clicked row (Ports / Processes / Connections) |
@@ -223,7 +229,7 @@ Press `?` at any time for an in-app key-binding overlay. The mouse is supported 
 | `S` | Reverse the sort direction |
 | click | Click a column header to sort by it; click again to reverse |
 
-### Search (Ports / Processes / Connections)
+### Search (Ports / Processes / Connections / Events)
 
 | Key      | Action |
 |----------|--------|
@@ -256,8 +262,15 @@ Press `?` at any time for an in-app key-binding overlay. The mouse is supported 
 
 ## Build & run
 
+Requires Go 1.24 or newer (see `go.mod`).
+
 ```bash
-go mod tidy
+go install github.com/nexusriot/ducknetview/cmd/ducknetview@latest
+```
+
+Or from a checkout:
+
+```bash
 go run ./cmd/ducknetview
 ```
 
@@ -310,8 +323,12 @@ log what changes, and serve metrics, all from one process:
 Change a threshold without losing the session:
 
 ```bash
-ducknetview --check-config && systemctl reload ducknetview
+sudo env XDG_CONFIG_HOME=/var/lib/ducknetview ducknetview --check-config && sudo systemctl reload ducknetview
 ```
+
+`--check-config` checks the config of whoever runs it; the packaged unit keeps
+its own at `/var/lib/ducknetview/ducknetview/config.json`, hence the
+`XDG_CONFIG_HOME`.
 
 The alert that matters most is on the monitor itself — a daemon that is up but
 no longer polling looks healthy in every other metric:
@@ -388,9 +405,18 @@ sudo systemctl enable --now ducknetview
 ```
 
 It runs under a `DynamicUser` with no privileges (the socket counters need
-none), keeps its config and history in `/var/lib/ducknetview`, logs events to
-`/var/log/ducknetview/`, and serves metrics on `127.0.0.1:9847`. Edit the unit
-to change any of that.
+none), keeps its config and history in `/var/lib/ducknetview/ducknetview/`,
+logs events to `/var/log/ducknetview/`, and serves metrics on `127.0.0.1:9847`.
+Edit the unit to change any of that.
+
+Without privileges it **cannot tell which process owns another user's socket**
+— the kernel only shows `/proc/<pid>/fd` to the owner, root, or a holder of
+`CAP_SYS_PTRACE` — so the rules that need a process (`alert_process_bps`,
+`alert_conn_growth_polls`, `alert_fanout_hosts`) and per-process usage stay
+silent for those sockets, and the daemon logs one `attribution_limited` event
+saying how many there are. The unit carries commented-out capability lines
+that lift this; enabling them is a deliberate trade-off, since
+`CAP_SYS_PTRACE` is a powerful capability.
 
 `dpkg-deb` is required. When cross-compiling, `CGO_ENABLED=0` is used.
 
@@ -401,9 +427,10 @@ to change any of that.
 `ducknetview --check-config` validates everything below and says what is being
 ignored and why — worth running after any hand-edit, and in a unit's
 `ExecStartPre` so a daemon refuses to start rather than running with half its
-rules quietly disabled.
+rules quietly disabled. Warnings (see above) are printed but do not fail it.
 
-Everything lives in one file, `${XDG_CONFIG_HOME:-~/.config}/ducknetview/config.json`,
+Everything lives in one file, `ducknetview/config.json` under the user config
+directory — `${XDG_CONFIG_HOME:-~/.config}` on Linux, `~/Library/Application Support` on macOS —
 and all of it is written for you as you change things — the thresholds, latency
 targets, hidden columns and theme through the **settings overlay (`,`)**, the
 rest through their own key bindings. Hand-editing still works for anything the
@@ -447,6 +474,9 @@ back to the default, so an old or hand-mangled file can't wedge the UI.
 | `alert_conn_growth_polls` | int | `,` | Alert after this many consecutive polls of a process's connection count only growing (a leak) |
 | `alert_fanout_hosts` | int | `,` | Alert when a process reaches this many new remote hosts in one poll (a scan) |
 | `alert_iface_drops_per_min` | number | `,` | Alert when one link exceeds this many errors + drops per minute |
+| `alert_listen_queue_pct` | number | `,` | Alert when a TCP listener's accept queue is this many percent of its backlog (an empty queue never fires) |
+| `alert_listen_drops_per_min` | number | `,` | Alert when the host drops more than this many connections per minute on the listen path (`ListenDrops`) |
+| `alert_close_wait` | int | `,` | Alert when one process holds this many sockets in CLOSE_WAIT |
 
 Every threshold is **off** when absent or `0`: the right number is entirely
 site-specific, which is why there is no default. Each rule re-fires at most once
@@ -458,8 +488,8 @@ a hidden column stays sortable through `s`:
 
 ```
 age  closed  conns  container  count  cpu  host  iface  life  listen  local
-mem  name  owner  pid  process  procs  proto  remote  rtt  rtx  rx  state
-states  svc  tx  user
+mem  name  netns  owner  pid  process  procs  proto  queue  remote  rtt  rtx
+rx  state  states  svc  tx  unit  user
 ```
 
 Hiding every column of a table is ignored, since an empty table reads as a bug
@@ -479,14 +509,19 @@ rather than loading as an empty table that silently never matches.
 ### Key bindings (`keys`)
 
 ```json
-{ "keys": { "closed": "Z", "settings": "S-," } }
+{ "keys": { "closed": "Z", "settings": "f2" } }
 ```
 
 The action names are the ones the help overlay lists. A binding is ignored —
 not obeyed — when the action is unknown, the key is reserved (`ctrl+c`, `tab`,
 `shift+tab`, the arrows, `pgup`/`pgdown`, `home`/`end`, `esc`, `ctrl+u`, the
 digits `1`–`7`) or another action already owns the key. Rebinding an action
-takes its default key away from it, so one press never does two things.
+takes its default key away from it, so one press never does two things. Key
+names are Bubble Tea's: a printable character as itself (`Z`, `!`), and
+`f1`–`f12`, `ctrl+…`, `alt+…` for the rest. A name that no key ever produces is
+not detected, and leaves the action unreachable. Bindings apply to the tabs
+only: overlays and confirmation prompts (the kill prompt's `t`/`k`/`h`, the
+views overlay's `n`/`d`) keep the letters they show on screen.
 
 ### A worked example
 
@@ -503,6 +538,8 @@ netblock, and the rules that catch a bad path:
   "alert_retrans_per_min": 60,
   "alert_fanout_hosts": 25,
   "alert_iface_drops_per_min": 60,
+  "alert_listen_queue_pct": 80,
+  "alert_close_wait": 100,
   "theme": "contrast"
 }
 ```
@@ -528,11 +565,14 @@ sub-millisecond and adds the series marked **live** below. A standalone
 | `ducknetview_iface_transmit_bytes_per_second` | gauge | `iface`, `kind` | Current transmit rate per interface |
 | `ducknetview_iface_errors_total` | counter | `iface`, `direction` | Errors + drops since boot |
 | `ducknetview_iface_up` | gauge | `iface` | 1 when the link is up |
-| `ducknetview_listeners` | gauge | `exposure` | Listening sockets by reachability (`exposed`, `lan`, `local`) |
+| `ducknetview_listeners` | gauge | `exposure` | Listening sockets by reachability (`exposed`, `lan`, `local`, `netns` — inside another network namespace and not published on the host) |
 | `ducknetview_listeners_off_baseline` | gauge | — | Listeners not in the saved baseline; **-1 when no baseline is saved**, which is different from clean |
 | `ducknetview_connections` | gauge | `scope` | Active connections by remote scope |
 | `ducknetview_connection_retransmits_total` | gauge | — | Retransmits summed over live TCP sockets |
 | `ducknetview_processes_with_sockets` | gauge | — | Processes holding at least one socket |
+| `ducknetview_listener_queue_ratio` | gauge | `local`, `process` | A TCP listener's accept-queue depth as a fraction of its backlog; 1 is full (Linux) |
+| `ducknetview_listener_accept_queue` | gauge | `local`, `process` | Connections waiting to be accepted on a TCP listener (Linux) |
+| `ducknetview_tcp_counter_total` | counter | `counter` | Host-wide TCP counters since boot: `listen_overflows`, `listen_drops`, `syncookies_sent`, `retrans_segs`, `timeouts`, `in_errs`, `out_rsts` (Linux) |
 | `ducknetview_build_info` | gauge | `version` | Always 1; the label carries the version — **live** |
 | `ducknetview_session_uptime_seconds` | gauge | — | How long this session has been running — **live** |
 | `ducknetview_last_poll_age_seconds` | gauge | — | Seconds since the last completed socket enumeration, **-1 before the first** — **live** |
@@ -561,8 +601,9 @@ hook or an alert rule matches on.
 
 | Kind | Level | Raised when |
 |------|-------|-------------|
-| `listener_up` | warn, **alert** when off-baseline | A listening socket appeared. The detail carries its exposure |
+| `listener_up` | warn, **alert** when off-baseline | A listening socket appeared. The detail carries its exposure and the owning systemd unit |
 | `listener_down` | info | A listening socket went away |
+| `baseline_drift` | **alert** | The session's first poll found listeners already outside the saved baseline. Once per session; the detail lists the first five |
 | `listener_moved` | info, **alert** when exposure widens | A service rebound to a different address on the same port |
 | `watchlist_hit` | **alert** | A connection matched the watchlist |
 | `new_destination` | info | First connection of the session to a public host |
@@ -575,13 +616,20 @@ hook or an alert rule matches on.
 | `packet_loss` | warn | `alert_retrans_per_min` exceeded |
 | `conn_growth` | warn | `alert_conn_growth_polls` consecutive polls of growth — a leak |
 | `fanout` | **alert** | `alert_fanout_hosts` new remotes in one poll — a scan |
+| `listen_queue` | warn | A listener's accept queue reached `alert_listen_queue_pct` of its backlog |
+| `listen_drops` | warn | The host dropped more than `alert_listen_drops_per_min` connections a minute on the listen path |
+| `close_wait` | warn | A process holds `alert_close_wait` sockets in CLOSE_WAIT — it is not closing what its peers closed |
 | `config_reloaded` | info, warn when part was ignored | `SIGHUP` re-read the config |
 | `attribution_limited` | info | Sockets owned by another user have no PID, so rows cannot be named or signalled. Once per session, and never for root |
+| `netns_limited` | info | Sockets in other network namespaces are incomplete: other users' namespaces are unreadable, byte counters there need root, or more than 32 namespaces exist. Once per session |
 | `link_errors_cleared` | info | The link has been under `alert_iface_drops_per_min` for a minute |
 | `throughput_process_cleared` | info | The process has been under `alert_process_bps` for a minute |
 | `throughput_connection_cleared` | info | The connection has been under `alert_connection_bps` for a minute — including because it closed |
 | `latency_cleared` | info | The connection has been under `alert_rtt_ms` for a minute |
 | `packet_loss_cleared` | info | The socket has been under `alert_retrans_per_min` for a minute |
+| `listen_queue_cleared` | info | The listener's accept queue has been under `alert_listen_queue_pct` for a minute |
+| `listen_drops_cleared` | info | The host has been under `alert_listen_drops_per_min` for a minute |
+| `close_wait_cleared` | info | The process has been under `alert_close_wait` for a minute — including because it exited |
 
 Only alert-level events run `--on-alert`, and only they count toward the tab
 badge and `ducknetview_alerts_total`. The `_cleared` kinds are deliberately
@@ -602,7 +650,8 @@ internal/probe/    - data collection: interfaces & rates, sockets (ports/procs/c
                      per-socket byte counters, RTT and retransmits via netlink,
                      container ids, process enrichment, service names, IP scope &
                      listener exposure, routing tables, the netlink neighbour cache,
-                     TCP latency probes, Wi-Fi radio state, ASN ownership lookups
+                     TCP latency probes, Wi-Fi radio state, ASN ownership lookups,
+                     listener accept queues, host TCP counters
 internal/ui/       - Bubble Tea model, views, styles & themes, sparklines, reverse DNS,
                      throughput rates, session totals, the 24h trend, closed-connection
                      history, event log, alert rules, listener baseline, row detail /
@@ -632,19 +681,21 @@ ROADMAP.md         - the feature backlog, in priority tiers
 - Settings are persisted to `${XDG_CONFIG_HOME:-~/.config}/ducknetview/config.json` as you change them — including the quick filters, the search mode and the last open tab. Delete that file to reset to defaults; malformed contents are ignored, and out-of-range values fall back to the default rather than wedging the UI. See [Configuration](#configuration) for the full key list.
 - **Alert thresholds** have no default, because the right number is entirely site-specific; set them in the settings overlay (`,`) or by hand. See [Configuration](#configuration) for all seven rules. Each one re-fires at most once a minute per subject.
 - `--on-alert` runs its command with the event's kind, subject and detail as arguments and `DNV_EVENT_KIND/LEVEL/SUBJECT/DETAIL/AT` in the environment. It is executed directly, never through a shell, so a process name or remote address can't be interpreted as a command; a hook is given 10 seconds before it is killed.
-- The **baseline** is stored in that same file as a `"baseline"` array of `"proto|bind_address"` entries plus a `"baseline_at"` timestamp. UDP sockets on ephemeral ports are deliberately excluded: UDP has no LISTEN state, so every outbound DNS query would otherwise register as a new listener and leave the baseline permanently dirty. They are still shown in the Ports table, and `--check-baseline` reports how many listeners it actually compared rather than how many exist.
+- The **baseline** is stored in that same file as a `"baseline"` array of `"proto|bind_address"` entries plus a `"baseline_at"` timestamp. Listeners inside other network namespaces are not part of it. UDP sockets on ephemeral ports are deliberately excluded: UDP has no LISTEN state, so every outbound DNS query would otherwise register as a new listener and leave the baseline permanently dirty. They are still shown in the Ports table, and `--check-baseline` reports how many listeners it actually compared rather than how many exist.
 - The **watchlist** is a `"watchlist"` array in that config file: each entry is a CIDR (`45.9.0.0/16`), a bare IP (`8.8.8.8`), or a regular expression tested against the remote IP *and* its resolved hostname (`amazonaws|\.ru$`). Matching connections are highlighted and logged as events. `w` on the Connections tab adds and removes the highlighted remote; hand-editing is only needed for CIDRs and regexes.
 - `e` exports the active tab to `ducknetview_<tab>_<timestamp>.csv` in the current working directory.
 - Service names come from `/etc/services` when readable, with a small built-in fallback for common ports.
-- **Throughput** is read from the kernel's per-socket counters (`tcpi_bytes_acked` / `tcpi_bytes_received`) over netlink `sock_diag`, the same source as `ss -ti`, and turned into a rate by diffing consecutive polls. This is Linux-only and TCP-only: UDP has no equivalent accounting, and neither do other platforms, where the RX/TX columns are hidden rather than shown empty. No elevated privileges are needed — the kernel reports other users' sockets to unprivileged callers, exactly as `ss` does. Rates appear one poll after a connection is first seen, since a rate needs two samples.
+- **Throughput** is read from the kernel's per-socket counters (`tcpi_bytes_acked` / `tcpi_bytes_received`) over netlink `sock_diag`, the same source as `ss -ti`, and turned into a rate by diffing consecutive polls. This is Linux-only and TCP-only: UDP has no equivalent accounting, and neither do other platforms, where the RX/TX columns are hidden rather than shown empty. No elevated privileges are needed for the host's own sockets — the kernel reports other users' sockets to unprivileged callers, exactly as `ss` does; sockets inside other network namespaces (containers) need root. Rates appear one poll after a connection is first seen, since a rate needs two samples.
 - **CPU%** is sampled between polls rather than averaged over the process lifetime, so a process that has just started working shows it. It can exceed 100% on multi-core hosts. The very first sighting of a PID falls back to the lifetime average, because one sample can't make a rate.
+- <a id="network-namespaces"></a>**Network namespaces.** `/proc/net/*` only shows ducknetview's own namespace, so containers on bridge networks were invisible. Each poll groups processes by `/proc/<pid>/ns/net` and reads every other namespace's socket tables through one member's `/proc/<pid>/net/{tcp,tcp6,udp,udp6}`, attributing sockets to that namespace's processes by their `/proc/<pid>/fd`. Unprivileged, other users' namespace links are unreadable, so root-owned containers stay invisible; byte counters inside a namespace need `setns` and therefore root, so without it those rows show no throughput. Either is recorded once per session as a `netns_limited` event. A container listener counts as published when a `docker-proxy` forwards to it (matched by container address and port); with `userland-proxy: false` Docker publishes through iptables alone, and those listeners stay classed `netns`. At most 32 namespaces are scanned per poll. Container listeners are not baselined — the publishing host port is.
 - **Container ids** are read from `/proc/<pid>/cgroup` and shortened to 12 characters. Names are not resolved: that would mean talking to each runtime's API.
+- **Systemd units** come from the same read: the innermost `.service` or `.scope` on the cgroup path, preferring the unified (v2) hierarchy, then cgroup v1's `name=systemd` one. Slices are skipped (they group units; nobody starts one), and so is a container runtime's own scope, which the CONTAINER column already covers.
 - Reverse DNS lookups have a 1.5 s timeout and are cached per session.
 - External IP fetch uses a fresh HTTP transport each time (avoids stale keep-alive sockets after VPN / route changes).
 - Copy-to-clipboard (`y`) uses `atotto/clipboard`. On Linux this shells out to `xclip`/`xsel` (X11) or `wl-copy` (Wayland) — install one of them, otherwise the copy fails with a status message.
 - **Session totals** are accumulated from the per-poll deltas, so they cover what happened while the tool was watching — not the whole life of a socket that predates it. The per-host and per-process tables are capped at 2048 entries, evicting the quietest first.
 - **Closed connections** keep the socket's final counters, which *are* its lifetime totals. The last 200 are retained; signalling from a closed row is deliberately disabled, since the PID may already have been recycled onto an unrelated process.
-- The **event log** records *changes*, so the first poll after startup establishes a baseline rather than reporting every existing listener and interface as new. It keeps its last 500 entries in memory; use `--log-events` for anything that needs to outlive the session. That file is rotated at 8 MiB, keeping one previous generation as `.1`.
+- The **event log** records *changes*, so the first poll after startup establishes a baseline rather than reporting every existing listener and interface as new — except that listeners outside a saved listener baseline are reported once, as `baseline_drift`. It keeps its last 500 entries in memory; use `--log-events` for anything that needs to outlive the session. That file is rotated at 8 MiB, keeping one previous generation as `.1`.
 - **Latency probes** measure a TCP handshake, counting a refused connection as a valid timing (the RST travelled the same path a SYN-ACK would have). Only the default gateways are probed by default (one per address family), so nothing leaves the LAN unless `latency_targets` says so. A `--json` snapshot carries one such probe, measured while the sampler is already waiting out its second, so it costs no extra time.
 - **`--daemon`** runs the same model under Bubble Tea with no renderer and no input attached, so there is one implementation of the polling, the rates and the rules rather than two. It takes the ordinary exit path on `SIGINT`/`SIGTERM`, which is what writes the day's usage totals — a hard stop would lose them.
 - **`--from ssh://host`** executes `ssh -o BatchMode=yes HOST ducknetview --json` directly, never through a shell, and the arguments are a fixed template rather than anything taken from the target, so a host name cannot smuggle in options. One fetch is bounded at 20 seconds and a second is never started behind a slow one. `BatchMode` means it will not sit waiting for a password; set up a key or an agent first.

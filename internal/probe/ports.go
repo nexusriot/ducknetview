@@ -16,6 +16,34 @@ type ListenPort struct {
 	PID     int32
 	Process string
 	User    string
+	Unit    string // systemd unit of the owning process, "" when unknown
+
+	// NetNS names the network namespace the socket lives in (a container id,
+	// an `ip netns` name or "netns:<inode>"); "" is ducknetview's own.
+	NetNS string `json:",omitempty"`
+	// Published is the host "ip:port" a namespaced listener is forwarded from
+	// (docker-proxy), "" when nothing on the host reaches it.
+	Published string `json:",omitempty"`
+
+	// Accept-queue depth and its limit (the effective listen() backlog), TCP
+	// and Linux only; Backlog is 0 when unknown. A queue near its limit is a
+	// service that is not calling accept() fast enough: the kernel has
+	// finished the handshakes and the application is not picking them up,
+	// and once full, new connections are dropped before the application ever
+	// sees them. Several SO_REUSEPORT sockets on one address share a row here
+	// and report one of their queues.
+	AcceptQueue uint32
+	Backlog     uint32
+}
+
+// QueueRatio is how full the accept queue is, 0–1 (it can exceed 1 briefly,
+// since the kernel admits one connection past the limit). ok is false when
+// the limit is unknown.
+func (p ListenPort) QueueRatio() (float64, bool) {
+	if p.Backlog == 0 {
+		return 0, false
+	}
+	return float64(p.AcceptQueue) / float64(p.Backlog), true
 }
 
 func connProto(c gnet.ConnectionStat) string {

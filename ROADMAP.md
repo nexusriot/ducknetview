@@ -1,7 +1,8 @@
 # Roadmap
 
 The 0.3.1 backlog — all fourteen items — shipped in 0.4.0, and this backlog's
-own Tier 1 shipped in 0.5.0; see [CHANGELOG.md](CHANGELOG.md). What follows is
+own Tier 1 shipped in 0.5.0, and the startup baseline-drift alert in 0.6.0; see
+[CHANGELOG.md](CHANGELOG.md). What follows is
 what is left, re-tiered. Every item was checked against the code rather than
 imagined, and nothing here is committed to.
 
@@ -33,44 +34,28 @@ else that process is doing. The drill machinery is already general enough.
 
 Small.
 
-### 4. Baseline drift a daemon started into
-
-A listener that *appears* outside the baseline already raises an alert-level
-`listener_up`, and `ducknetview_listeners_off_baseline` counts the rest. What
-nothing reports is drift that was already there when the session began: the
-first poll is deliberately the baseline, so nothing is "new", and a daemon
-restarted onto a host that has been listening on something unexpected for a
-week says nothing at all about it.
-
-One alert on the first poll when the count is non-zero would close it, and the
-count is computed already.
-
-Small.
-
-Small.
-
 ## Tier 2 — polish
 
-### 5. User-defined themes
+### 4. User-defined themes
 
 Three built-in palettes, and the palette struct is already the only place
 colours come from. A `themes` map in the config would let somebody match their
 terminal rather than pick the nearest of three.
 
-### 6. Rebind keys from the settings overlay
+### 5. Rebind keys from the settings overlay
 
-`keys` is the one thing the overlay documents but cannot edit, which leaves
-exactly the gap the overlay was built to close.
+`keys` is the one setting the overlay cannot edit — it is still hand-edited
+JSON — which leaves exactly the gap the overlay was built to close.
 
-### 7. Mouse in the overlays
+### 6. Mouse in the overlays
 
 Rows are clickable in the tables and not in the help or settings overlays.
 
-### 8. Search on the Routes tab
+### 7. Search on the Routes tab
 
 Every other scrollable view has `/`. A host with forty routes does not.
 
-### 9. Event log export from the daemon
+### 8. Event log export from the daemon
 
 `e` exports events to CSV from the TUI; headless there is only the JSONL
 stream. A `--dump-events` that renders the ring on exit would close it.

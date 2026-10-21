@@ -63,3 +63,19 @@ func (m *Model) noteAttribution(rec *eventRecorder) {
 	rec.add(levelInfo, "attribution_limited", note,
 		"sockets belonging to other users have no PID, so they cannot be named or signalled")
 }
+
+// Containers live in network namespaces of their own, and seeing into them
+// needs privileges an ordinary user lacks: their processes' namespace links
+// are unreadable, and their byte counters need setns. The rows that can be
+// seen are still shown; noteNetNS says once why the rest are missing.
+
+// noteNetNS records the namespace limitation once per session, for the same
+// reason noteAttribution does: it does not change between polls.
+func (m *Model) noteNetNS(rec *eventRecorder) {
+	if m.netnsNoted || m.netns.Limited == "" {
+		return
+	}
+	m.netnsNoted = true
+	rec.add(levelInfo, "netns_limited", m.netns.Limited,
+		"sockets inside containers and other network namespaces may be missing or show no throughput")
+}

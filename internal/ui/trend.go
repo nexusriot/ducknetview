@@ -155,6 +155,7 @@ func (m *Model) recordTrend(rx, tx float64, now time.Time) {
 	}
 	m.trendFlushed = now
 	m.trend.save()
+	m.saveUsage()
 }
 
 // renderTrend draws the day-long view. It is the one panel that can answer a

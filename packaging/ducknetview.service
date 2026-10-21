@@ -5,15 +5,24 @@ After=network.target
 
 [Service]
 # No elevated privileges: the socket counters come from sock_diag, which the
-# kernel reports to unprivileged callers exactly as it does to ss(8).
+# kernel reports to unprivileged callers exactly as it does to ss(8). What an
+# unprivileged account cannot do is tell which process owns another user's
+# socket (that needs /proc/<pid>/fd), so per-process rules and usage are blind
+# to those sockets and an attribution_limited event says how many there are.
+# To lift that, at the cost of granting a powerful capability, uncomment:
+#AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+#CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 # DynamicUser gives it a private account rather than sharing nobody, and
 # StateDirectory gives that account somewhere to keep its config, baseline,
-# usage history and trend.
+# usage history and trend (under /var/lib/ducknetview/ducknetview/, since the
+# config directory is $XDG_CONFIG_HOME/ducknetview).
 DynamicUser=yes
 StateDirectory=ducknetview
 Environment=XDG_CONFIG_HOME=/var/lib/ducknetview
 
 # Refuse to start rather than running with half the rules quietly disabled.
+# Warnings, such as a latency target that does not resolve yet at boot, are
+# logged but do not stop it.
 ExecStartPre=/usr/bin/ducknetview --check-config
 ExecStart=/usr/bin/ducknetview --daemon \
     --log-events /var/log/ducknetview/events.jsonl \
@@ -25,15 +34,16 @@ LogsDirectory=ducknetview
 # what a long-running daemon accumulates.
 ExecReload=/bin/kill -HUP $MAINPID
 
-# The daemon writes the day's usage totals on the way out, so it must be given
-# the chance to exit rather than being killed outright.
+# The daemon flushes usage totals every five minutes and once more on the way
+# out, so it should be given the chance to exit rather than being killed.
 KillSignal=SIGTERM
 TimeoutStopSec=15
 
 Restart=on-failure
 RestartSec=5
 
-# It only reads /proc and its own state directory.
+# It reads /proc, /etc/resolv.conf and /etc/services, writes only its state and
+# log directories, and listens on the metrics address above.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

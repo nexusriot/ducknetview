@@ -152,7 +152,11 @@ func (m *Model) clearDrill() string {
 	case tabPorts:
 		m.portsCursor = clampInt(cursor, 0, max(0, len(m.filteredPorts())-1))
 	}
-	m.applyFilterChange()
+	// Not applyFilterChange: that resets the cursor this just restored.
+	m.rerenderActiveTable()
+	if c, vp := m.activeTableState(); c != nil {
+		ensureCursorVisible(vp, *c)
+	}
 	return "Back to " + tabLabel(back)
 }
 

@@ -32,6 +32,11 @@ import (
 var binPath string
 
 func TestMain(m *testing.M) {
+	// The namespace test re-executes this binary as the resident of a fresh
+	// network namespace (see netns_test.go); that copy runs no tests.
+	if os.Getenv(netnsChildEnv) != "" {
+		os.Exit(netnsChild())
+	}
 	binPath = os.Getenv("DUCKNETVIEW_BIN")
 	if binPath == "" {
 		fmt.Fprintln(os.Stderr,

@@ -4,9 +4,72 @@ All notable changes to ducknetview. Versions are the value of
 `internal/version/version.go`, which the Makefile, `build-deb.sh` and
 `DEBIAN/control` all read.
 
-## Unreleased
+## 0.6.0 — 2026-10-21
 
-A review pass, then five features it suggested.
+A review pass, then the features it suggested.
+
+### Host TCP health
+
+Three signals about connections that go wrong where no socket table can show
+them, all from data the probe layer was already reading or one file away from
+it.
+
+- **Accept queues.** The `sock_diag` dump already returned every listening
+  socket with its accept-queue depth and backlog, and the tool threw both away.
+  The Ports tab now has a QUEUE column (`waiting/backlog`, amber from half full,
+  red near the limit, sortable by fill), the detail overlay gives the
+  percentage, `ducknetview_listener_queue_ratio` and
+  `ducknetview_listener_accept_queue` export it, and `alert_listen_queue_pct`
+  raises `listen_queue` (and `listen_queue_cleared`). A full queue is a service
+  that is not calling `accept()` fast enough, and once it is full the kernel
+  drops new connections before the application ever sees them.
+- **Host TCP counters** from `/proc/net/snmp` and `/proc/net/netstat`: listen
+  overflows and drops, SYN cookies sent, retransmitted segments, retransmit
+  timeouts, bad segments and resets sent. A Host TCP panel on the Overview
+  lists the ones that are moving as per-minute rates, `--json` carries them
+  under `tcp` (totals and per-second rates), `ducknetview_tcp_counter_total`
+  exports them, and `alert_listen_drops_per_min` raises `listen_drops` (and
+  `listen_drops_cleared`) — the one signal of connections refused before they
+  became a row anywhere.
+- **CLOSE_WAIT per process.** A socket the peer closed and the process never did
+  sits in CLOSE_WAIT looking ordinary; a pile of them is the classic "never
+  closes its sockets" bug on its way to running out of descriptors. The count is
+  in the Processes detail overlay (summed for folded rows), in `--json` and the
+  CSV export, and `alert_close_wait` raises `close_wait` (and
+  `close_wait_cleared`).
+
+All three thresholds are off by default and editable from the settings overlay
+(`,`). Every piece is Linux-only and simply absent elsewhere.
+
+### Containers' sockets are visible
+
+Sockets were enumerated from `/proc/net/*`, which is ducknetview's own network
+namespace — so a container on a bridge network, which has a namespace of its
+own, showed nothing but the `docker-proxy` in front of its published port. The
+CONTAINER column promised more than the tool could see. Processes are now
+grouped by `/proc/<pid>/ns/net`, and each other namespace is enumerated through
+one member's `/proc/<pid>/net/{tcp,tcp6,udp,udp6}` (no `setns` needed),
+attributed to that namespace's processes. Rows carry a namespace label — the
+container id, an `ip netns` name, or `netns:<inode>` — shown in a **NETNS**
+column on the Ports and Connections tabs once there is more than one namespace,
+and searchable, so typing a container id filters to it.
+
+A container's `0.0.0.0:80` is not the host's: it is reachable only from the
+host and its bridges unless the host forwards a port to it. Such a listener is
+classed `netns` (amber, not orange) unless a `docker-proxy` publishes it, in
+which case it takes the exposure of the host address and the detail overlay
+says which. `ducknetview_listeners` gains `exposure="netns"`. Container
+listeners are logged as events but kept out of the baseline: what a container
+offers the network is the host port that publishes it, and container ids change
+on every recreate.
+
+Throughput inside a namespace needs `sock_diag` there, which needs `setns` and
+so root (it is done on a locked OS thread that returns to its own namespace
+before the dump runs). Without root those rows are shown without throughput,
+and — like processes whose namespace other users' permissions hide — that is
+recorded once per session as a `netns_limited` event. At most 32 namespaces
+are scanned per poll, and the namespace map is built once per poll.
+
 
 ### Saved views (`V`)
 
@@ -31,6 +94,28 @@ minute, including when the subject went away entirely because the transfer
 finished or the process exited. `fanout` and `conn_growth` have no counterpart:
 a burst is a moment rather than a state, and no single poll can know that a
 scan has stopped.
+
+### Processes and listeners name their systemd unit
+
+A daemon's log said `pid 812 (nginx)`, and by the time anyone read it the PID
+meant nothing. The unit — `nginx.service`, `session-2.scope`, or
+`pipewire.service` under `user@1000.service` — comes from the same
+`/proc/<pid>/cgroup` read that already finds the container id, so it costs
+nothing. Processes and Ports gain a sortable, hideable UNIT column (key `unit`)
+that appears only when some row has a unit, as CONTAINER does; the detail
+overlay shows it, `/` searches it, the CSV export carries it, and
+`listener_up`, `listener_down`, `listener_moved` and `throughput_process` name
+it beside the PID. The innermost service or scope wins, slices are skipped, and
+a container runtime's own scope is left to the CONTAINER column.
+
+### Drift that predates the session is reported
+
+The first poll is deliberately the "new listener" baseline, so a daemon
+restarted onto a host that had been listening outside its saved baseline for a
+week said nothing about it. With a baseline saved, the first poll now raises one
+alert-level `baseline_drift` event listing the off-baseline listeners (five,
+then "N more"), so `--on-alert` fires for it. One event rather than one per
+listener: it is a single finding, and a pager should hear about it once.
 
 ### An IPv6-only host has a default route after all
 
@@ -138,6 +223,55 @@ Every table renders its rows through its column list except Processes, which
 hand-rolled the separators. The header dropped a hidden column and the row did
 not, so `hidden_columns` misaligned the whole table from that column rightward,
 and click-to-sort then landed on the wrong column.
+
+### A second review pass: functional fixes
+
+- **The IPv6 default route was the kernel's `lo` reject route.** Its metric,
+  `0xffffffff`, overflowed a signed parse to 0 and beat the real default, so
+  the `gateway6` probe was never created and an IPv6-only host reported
+  "default via lo". The metric is parsed unsigned, and `RTF_REJECT` routes are
+  skipped in both families.
+- **Every bound UDP socket was also listed as a connection** to `0.0.0.0:0`:
+  gopsutil renders an unconnected peer as `0.0.0.0`/`::`, never as empty. A
+  remote port of 0 now means no peer. Kernel TCP counters are no longer
+  attached to a UDP socket that shares a TCP socket's 4-tuple.
+- **`esc` on the Interfaces tab quit without saving**, through the list
+  widget's own quit binding, and `/` there opened a filter the global keys
+  kept stealing from. Both of the widget's bindings are off.
+- **Rebinding a key hijacked the overlays.** `"hide-noise": "H"` turned the
+  kill prompt's `h` (SIGHUP) into a cancel. Translation now applies to the tabs
+  only. A custom key that is also another action's default now always wins
+  rather than depending on map order.
+- **The daemon wrote its config back over the file on every stop**, reverting
+  whatever had been edited since the last `SIGHUP`. A headless session never
+  writes the config now, and no longer polls `api.ipify.org` for an address
+  nothing displays.
+- **A `SIGHUP` reload kept settings deleted from the file** (the baseline,
+  hidden columns, bits/s, highlight search).
+- **Usage history is flushed every five minutes**, each flush booking only
+  what was counted since the last one against the current day. It used to be
+  written only on a clean exit, against the exit day: a crash lost all of it,
+  and a fortnight's daemon run landed on one date. A connection's first
+  interval, and all of a short one, are counted now too.
+- **`--check-config` warnings.** A key differing only in case is applied by
+  the loader, and an unresolvable latency target may only mean DNS is not up
+  yet; both are now warnings that do not fail the check (or the unit's
+  `ExecStartPre`).
+- **Exit status 2 for every usage or collection error**, as the man page
+  says; several paths exited 1, which `--diff` and `--check-baseline` use to
+  mean "differences found". Stray positional arguments, negative `--top` /
+  `--usage` and `--daemon --from` are refused. `--metrics-listen` is no longer
+  bound by one-shot modes that exit immediately.
+- **Bash completion of `--view` started the TUI.** `--view=` now lists the
+  saved views and exits; both completions use it, and zsh completes the two
+  `--diff` files.
+- Smaller: pause works in a live `--from ssh://` session; overlays own the
+  mouse; going back from a drill restores the cursor; `NaN`/`Inf` thresholds
+  are refused; TCP/UDP twins on one address sort stably; the detail overlay no
+  longer shows 0% CPU on a process's first poll; a failed event-log rotation
+  reopens the log and a daemon reports log I/O errors on stderr; the journal
+  echo escapes control characters; CSV exports defuse cells a spreadsheet
+  would run as formulas; `NetSampler` is safe against overlapping samples.
 
 ## 0.5.1 — 2026-10-12
 

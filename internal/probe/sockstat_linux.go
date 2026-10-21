@@ -38,6 +38,8 @@ const (
 	diagMsgRecvQ = 56
 	diagMsgSendQ = 60
 
+	tcpStateListen = 10 // TCP_LISTEN in inet_diag_msg.idiag_state
+
 	diagRecvTimeout = 2 * time.Second
 	diagMaxReads    = 512 // backstop against a runaway multipart dump
 )
@@ -62,19 +64,35 @@ func SockStats() (map[string]SockStat, error) {
 }
 
 func dumpTCPDiag(family uint8, out map[string]SockStat) error {
-	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_DGRAM, netlinkInetDiag)
+	fd, err := openDiagSocket()
 	if err != nil {
 		return err
 	}
 	defer syscall.Close(fd)
+	return dumpTCPDiagOn(fd, family, out)
+}
+
+// openDiagSocket opens a sock_diag netlink socket. The socket answers for the
+// network namespace it was created in, whichever thread later reads it — which
+// is what lets nsSockStats leave a foreign namespace before dumping.
+func openDiagSocket() (int, error) {
+	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_DGRAM, netlinkInetDiag)
+	if err != nil {
+		return -1, err
+	}
 
 	// Without a receive timeout a lost or dropped multipart dump would block the
 	// refresh command goroutine forever.
 	tv := syscall.NsecToTimeval(int64(diagRecvTimeout))
 	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
-		return err
+		syscall.Close(fd)
+		return -1, err
 	}
+	return fd, nil
+}
 
+// dumpTCPDiagOn runs one family's TCP dump on an open sock_diag socket.
+func dumpTCPDiagOn(fd int, family uint8, out map[string]SockStat) error {
 	if err := syscall.Sendto(fd, diagRequest(family), 0, &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}); err != nil {
 		return err
 	}
@@ -131,13 +149,12 @@ func diagRequest(family uint8) []byte {
 // parseDiagMessage decodes one inet_diag_msg and its attributes. ok is false
 // for messages that are too short or carry no tcp_info (e.g. TIME_WAIT sockets,
 // which the kernel reports without the extension).
+//
+// Listening sockets are keyed by ListenKey instead, and need no tcp_info: for
+// them the kernel reuses the queue fields of inet_diag_msg itself, reporting
+// the current accept-queue depth as RecvQ and the listen() backlog as SendQ.
 func parseDiagMessage(data []byte) (string, SockStat, bool) {
 	if len(data) < sizeofDiagMsg {
-		return "", SockStat{}, false
-	}
-
-	st, ok := parseDiagInfo(data[sizeofDiagMsg:])
-	if !ok {
 		return "", SockStat{}, false
 	}
 
@@ -149,9 +166,18 @@ func parseDiagMessage(data []byte) (string, SockStat, bool) {
 	if local == "" || remote == "" {
 		return "", SockStat{}, false
 	}
+	recvQ := binary.NativeEndian.Uint32(data[diagMsgRecvQ : diagMsgRecvQ+4])
+	sendQ := binary.NativeEndian.Uint32(data[diagMsgSendQ : diagMsgSendQ+4])
 
-	st.RecvQ = binary.NativeEndian.Uint32(data[diagMsgRecvQ : diagMsgRecvQ+4])
-	st.SendQ = binary.NativeEndian.Uint32(data[diagMsgSendQ : diagMsgSendQ+4])
+	if data[1] == tcpStateListen {
+		return ListenKey(local), SockStat{RecvQ: recvQ, SendQ: sendQ}, true
+	}
+
+	st, ok := parseDiagInfo(data[sizeofDiagMsg:])
+	if !ok {
+		return "", SockStat{}, false
+	}
+	st.RecvQ, st.SendQ = recvQ, sendQ
 
 	return SockKey(local, remote), st, true
 }

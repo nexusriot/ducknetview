@@ -20,7 +20,8 @@ _ducknetview() {
             return 0
             ;;
         --view)
-            COMPREPLY=( $(compgen -W "$(ducknetview --view '' 2>&1 | sed -n 's/.*saved: //p' | tr -d ',')" -- "$cur") )
+            # An explicitly empty --view lists the saved views and exits.
+            COMPREPLY=( $(compgen -W "$(ducknetview --view= 2>/dev/null)" -- "$cur") )
             return 0
             ;;
         --top|--usage|--metrics-listen)
